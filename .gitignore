@@ -1,0 +1,12 @@
+dist/
+build/
+__pycache__/
+*.spec
+*.log
+.venv/
+.env
+build_slave_exe.js
+node_modules/
+package.json
+package-lock.json
+New Text Document.txt
