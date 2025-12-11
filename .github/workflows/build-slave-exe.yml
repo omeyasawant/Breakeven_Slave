@@ -30,17 +30,17 @@ jobs:
 
       - name: Build Breakeven_Slave.exe
         run: |
-          pyinstaller --onefile Breakeven_Slave.py 
-            --name Breakeven_Slave 
-            --hidden-import breakeven_quant 
-            --hidden-import pandas_ta 
-            --hidden-import ta 
-            --hidden-import backtesting 
-            --hidden-import bokeh 
-            --hidden-import seaborn 
-            --hidden-import plotly 
-            --hidden-import numba 
-            --hidden-import pyarrow
+          pyinstaller --onefile Breakeven_Slave.py
+          --name Breakeven_Slave
+          --hidden-import breakeven_quant
+          --hidden-import pandas_ta
+          --hidden-import ta
+          --hidden-import backtesting
+          --hidden-import bokeh
+          --hidden-import seaborn
+          --hidden-import plotly
+          --hidden-import numba
+          --hidden-import pyarrow
 
       - name: Verify EXE exists
         shell: pwsh
