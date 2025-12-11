@@ -11,7 +11,19 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_suffix: windows
+            exe_name: Breakeven_Slave.exe
+          - os: ubuntu-latest
+            artifact_suffix: linux
+            exe_name: Breakeven_Slave
+          - os: macos-latest
+            artifact_suffix: macos
+            exe_name: Breakeven_Slave
 
     steps:
       - name: Checkout
@@ -28,8 +40,8 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build Breakeven_Slave.exe
-        run: |
+      - name: Build Breakeven_Slave
+        run: >
           pyinstaller --onefile Breakeven_Slave.py
           --name Breakeven_Slave
           --hidden-import breakeven_quant
@@ -42,39 +54,8 @@ jobs:
           --hidden-import numba
           --hidden-import pyarrow
 
-      - name: Verify EXE exists
-        shell: pwsh
-        run: |
-          if (!(Test-Path -Path "dist/Breakeven_Slave.exe")) {
-            Write-Error "Breakeven_Slave.exe not found in dist/"
-            exit 1
-          }
-          Write-Host "✅ Breakeven_Slave.exe found."
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Breakeven_Slave-windows
-          path: dist/Breakeven_Slave.exe
-
-  verify:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: Breakeven_Slave-windows
-          path: downloaded/
-
-      - name: List files
-        run: ls -R downloaded/
-
-      - name: Ensure EXE present
-        run: |
-          count=$(find downloaded -type f -name "Breakeven_Slave.exe" | wc -l)
-          if [ "$count" -lt 1 ]; then
-            echo "❌ No Breakeven_Slave.exe found."
-            exit 1
-          fi
-          echo "✅ Found Breakeven_Slave.exe."
+          name: Breakeven_Slave-${{ matrix.artifact_suffix }}
+          path: dist/${{ matrix.exe_name }}

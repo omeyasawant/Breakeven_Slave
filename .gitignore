@@ -1,4 +1,5 @@
 dist/
+slave_dist/
 build/
 __pycache__/
 *.spec
