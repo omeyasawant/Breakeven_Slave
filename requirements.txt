@@ -13,6 +13,7 @@ scipy
 plotly
 seaborn
 ta
+psutil
 backtesting
 bokeh
 tqdm

@@ -67,6 +67,8 @@ jobs:
           --hidden-import plotly
           --hidden-import numba
           --hidden-import pyarrow
+          --hidden-import psutil
+
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
