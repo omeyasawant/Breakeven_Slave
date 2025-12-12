@@ -55,7 +55,7 @@ jobs:
       - name: Build Breakeven_Slave
         shell: bash -l {0}
         run: >
-          pyinstaller --onefile Breakeven_Slave.py
+          python -m PyInstaller --onefile Breakeven_Slave.py
           --name Breakeven_Slave
           --hidden-import breakeven_quant
           --hidden-import pandas_ta
