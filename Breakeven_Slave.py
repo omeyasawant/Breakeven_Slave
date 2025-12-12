@@ -58,12 +58,26 @@ POOL_TIMEOUT_SEC   = 5400        # 90 min – generous share-timeout
 # In[ ]:
 
 
+
+
+
+# In[ ]:
+
+
 # --- Logging to file so Electron dashboard can read output ---
 #LOG_DIR = os.path.join(os.path.expanduser("~"), "BreakEvenClient", "logs")
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "slave.log")
 
+# --- PID Tracker (parent process only, no tqdm interference) ---
+PID_TRACK_DIR = LOG_DIR   # keep it alongside slave.log
+PID_TRACK_FILE = os.path.join(PID_TRACK_DIR, "slave_pid_tracker.log")
+
+def pid_track(msg: str):
+    ts = datetime.datetime.now().isoformat()
+    with open(PID_TRACK_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{ts} | {msg}\n")
 
 class Tee:
     def __init__(self, *streams):
@@ -78,16 +92,39 @@ class Tee:
         for s in self.streams:
             s.flush()
 
+# Log basic launch info using existing logging
+LAUNCH_TIME = datetime.datetime.now().isoformat()
+PID = os.getpid()
+
+
+IS_PARENT_PROCESS = (mp.parent_process() is None)
+
+if IS_PARENT_PROCESS:
+    print("")
+    print("====================================================")
+    print(f"[SLAVE] Breakeven_Slave.py LAUNCH")
+    print(f"[SLAVE] PID           : {PID}")
+    print(f"[SLAVE] Launch time   : {LAUNCH_TIME}")
+    print(f"[SLAVE] Log file      : {LOG_FILE}")
+    print(f"[SLAVE] Working dir   : {os.getcwd()}")
+    print("====================================================")
+    print("")
 
 _log_fp = open(LOG_FILE, "w", buffering=1, encoding="utf-8")
 sys.stdout = Tee(sys.stdout, _log_fp)
 sys.stderr = Tee(sys.stderr, _log_fp)
 # --------------------------------------------------------------
 
-# Log basic launch info using existing logging
-LAUNCH_TIME = datetime.datetime.now().isoformat()
-PID = os.getpid()
 
+
+pid_track("=============================================================================")
+pid_track("[SLAVE] Breakeven_Slave.py LAUNCH")
+pid_track(f"[SLAVE] PID           : {PID}")
+pid_track(f"[SLAVE] Launch time   : {LAUNCH_TIME}")
+pid_track(f"[SLAVE] Log file      : {LOG_FILE}")
+pid_track(f"[SLAVE] Working dir   : {os.getcwd()}")
+pid_track("=============================================================================")
+'''
 print("")
 print("====================================================")
 print(f"[SLAVE] Breakeven_Slave.py LAUNCH")
@@ -97,6 +134,7 @@ print(f"[SLAVE] Log file      : {LOG_FILE}")
 print(f"[SLAVE] Working dir   : {os.getcwd()}")
 print("====================================================")
 print("")
+'''
 
 
 # ## Messaging Protocols
@@ -952,6 +990,7 @@ def connect_to_master(master_ip='socket.breakeventx.com', master_port=8888):
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
 
     try:
         ready_path = os.path.join(os.getcwd(), "slave_ready.txt")
