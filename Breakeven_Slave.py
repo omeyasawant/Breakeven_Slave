@@ -235,7 +235,11 @@ def recv_message(sock):
     msglen = int.from_bytes(raw_msglen, byteorder='big')
 
     # Receive full message based on length
-    return recvall(sock, msglen).decode()
+    #return recvall(sock, msglen).decode()
+    body = recvall(sock, msglen)
+    if not body:
+        return None
+    return body.decode(errors="replace")
 
 def recvall(sock, n):
     data = bytearray()
