@@ -218,6 +218,14 @@ def send_message(conn, message_dict):
 # In[ ]:
 
 
+def safe_send(conn, payload):
+    with SEND_LOCK:
+        send_message(conn, payload)
+
+
+# In[ ]:
+
+
 def recv_message(sock):
     # First receive 4-byte length prefix
     raw_msglen = recvall(sock, 4)
@@ -421,10 +429,15 @@ def heartbeat_sender(conn, work_id, work_name, get_progress, stop_event):
                     "stream_type": "progress_update",
                     "progress_percent": progress
                 }
-                send_message(conn, message)
-    
+                #send_message(conn, message)
+                safe_send(conn, message)
+
+            except ssl.SSLError as e:
+                print(f"\n[HEARTBEAT ERROR] SSL broken — aborting retries : {e}")
+                break
+            
             except (socket.error, OSError) as e:
-                print(f"[HEARTBEAT ERROR] Heartbeat sender stopped: {e}")
+                print(f"\n[HEARTBEAT ERROR] Heartbeat sender stopped: {e}")
                 break
     
             except Exception as e:
@@ -507,7 +520,8 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
     slave_start_time = int(time.time() * 1000)  # Time when starting actual work
 
     WORK_STATUS = "working"
-    send_message(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
+    #send_message(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
+    safe_send(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
 
     
     try:
@@ -720,7 +734,8 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            send_message(conn, final_packet)
+            #send_message(conn, final_packet)
+            safe_send(conn, final_packet)
             print(f"\n[FINAL] Sent final result for work_id={work_id} (attempt {attempt}/{MAX_RETRIES})")
         except Exception as e:
             print(f"\n[FINAL][ERROR] send failed for work_id={work_id} (attempt {attempt}/{MAX_RETRIES}): {e}")
@@ -751,7 +766,8 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
         progress_bar.close()  # Close tqdm cleanly
 
         WORK_STATUS = "idle"
-        send_message(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
+        #send_message(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
+        safe_send(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
         
         pass
     else:
@@ -852,7 +868,8 @@ def connect_to_master(master_ip='socket.breakeventx.com', master_port=8888):
             client = tls_context.wrap_socket(raw_sock, server_hostname=master_ip)
 
             # Step 3: TLS-secured handshake
-            send_message(client, handshake)
+            #send_message(client, handshake)
+            safe_send(client, handshake)
             print(f"[SLAVE] Connected (TLS) to master at {master_ip}:{master_port}")
 
             
@@ -932,7 +949,8 @@ def connect_to_master(master_ip='socket.breakeventx.com', master_port=8888):
                                 }
                             }
                     #client.send(json.dumps(sys_info).encode())
-                    send_message(client, sys_info)
+                    #send_message(client, sys_info)
+                    safe_send(client, sys_info)
     
                 elif msg.get("command") == "request_sys_info":
                     sys_info = {
@@ -952,7 +970,8 @@ def connect_to_master(master_ip='socket.breakeventx.com', master_port=8888):
                                     "buffer_cores": buffer_cores
                                 }
                             }
-                    send_message(client, sys_info)
+                    #send_message(client, sys_info)
+                    safe_send(client, sys_info)
     
                 elif msg.get("command") == "assign_work":
                     work_id = msg["work_id"]
