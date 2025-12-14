@@ -218,6 +218,7 @@ def send_message(conn, message_dict):
 # In[ ]:
 
 
+SEND_LOCK = threading.Lock()
 def safe_send(conn, payload):
     with SEND_LOCK:
         send_message(conn, payload)
