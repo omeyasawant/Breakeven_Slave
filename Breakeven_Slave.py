@@ -808,7 +808,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
     print(f"[WORK] Completed work {work_id}: {work_name} ({work_type})")
 
 
-def connect_to_master(master_ip='socket.breakeventx.com', master_port=8888):
+def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     global slave_id
     global buffer_cores
     global slave_name
@@ -866,6 +866,11 @@ def connect_to_master(master_ip='socket.breakeventx.com', master_port=8888):
             # Step 1: TCP connection
             raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Windows keepalive tuning
+            if sys.platform.startswith("win"):
+                SIO_KEEPALIVE_VALS = 0x98000004
+                raw_sock.ioctl(SIO_KEEPALIVE_VALS, (1, 30_000, 10_000))  # idle=30s, interval=10s
             raw_sock.settimeout(None)  # block connection forever
             raw_sock.connect((master_ip, master_port))
 
@@ -921,7 +926,8 @@ def connect_to_master(master_ip='socket.breakeventx.com', master_port=8888):
                 '''
                 data = recv_message(client)
                 if not data:
-                    continue
+                    raise ConnectionError("Server closed connection")
+                    #continue
                 
                 #last_msg_time = time.time()  # Reset timer on valid message
                 
