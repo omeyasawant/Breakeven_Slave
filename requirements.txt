@@ -1,0 +1,20 @@
+# Dependencies for service
+
+# Tray App Service 
+PyQt5>=5.15
+pyqt5
+
+# Breakeven Slave Service
+pandas-ta==0.3.14b0
+pandas==1.5.3
+numpy==1.24.4
+numba==0.57.1
+scipy
+plotly
+seaborn
+ta
+psutil
+backtesting
+bokeh
+tqdm
+pyarrow
