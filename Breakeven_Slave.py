@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
+# In[1]:
 
 
 # slave.py
@@ -36,17 +36,30 @@ from typing import Optional, Tuple, List
 import zstandard as zstd
 
 
-# In[ ]:
+# In[2]:
 
 
 import requests
 import hashlib
+import io, gzip, pickle, os
+import requests
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from backtesting import Strategy
+from backtesting import Backtest
+
+
+# In[3]:
+
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # ## Global Variables
 # 
 
-# In[ ]:
+# In[4]:
 
 
 slave_id = None
@@ -56,6 +69,8 @@ total_subtasks = 0
 completed = None
 WORK_STATUS = "idle"
 FINAL_RESULT_ACK_EVENTS = {}  # work_id -> threading.Event
+APPEND_WAITERS = {}  # req_id -> (Event, holder)
+
 
 # --- TIMEOUT CONFIG (slave side) ---------------------------------
 HEARTBEAT_INTERVAL = 10          # seconds
@@ -63,9 +78,32 @@ POOL_TIMEOUT_SEC   = 5400        # 90 min – generous share-timeout
 # -----------------------------------------------------------------
 
 
+# In[5]:
+
+
+# Global session for ALL HTTP calls to MinIO (PUT/GET)
+_HTTP = requests.Session()
+
+retries = Retry(
+    total=5,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "PUT", "POST", "HEAD"]
+)
+
+adapter = HTTPAdapter(
+    pool_connections=200,
+    pool_maxsize=200,
+    max_retries=retries
+)
+
+_HTTP.mount("http://", adapter)
+_HTTP.mount("https://", adapter)
+
+
 # ## Connection DEBUGS
 
-# In[ ]:
+# In[6]:
 
 
 # -------------------- CONNECT DEBUG + SPEED --------------------
@@ -128,7 +166,7 @@ def recv_message_timeout(sock, timeout_sec: float):
 
 # ## S3 Fetch
 
-# In[ ]:
+# In[7]:
 
 
 def sha256_bytes(b: bytes) -> str:
@@ -175,9 +213,46 @@ def fetch_payload_ref(payload_ref: dict) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
+# In[8]:
+
+
+def api_append_rows_gz(conn, slave_id, work_id, token, dir_name, abs_path, header, rows, allowed_output_prefix, timeout=600):
+    req_id = uuid.uuid4().hex
+    rel = to_rel_path_under_run(abs_path, dir_name)
+    rel_path = f"{allowed_output_prefix.rstrip('/')}/{rel}"
+
+    msg = {
+        "command": "api_append_rows",
+        "slave_id": slave_id,
+        "work_id": work_id,
+        "token": token,
+        "req_id": req_id,
+        "rel_path": rel_path,
+        "header": header,
+        "rows": rows,
+        "compression": "gzip",
+    }
+
+    ev = threading.Event()
+    holder = {"resp": None}
+    APPEND_WAITERS[req_id] = (ev, holder)
+
+    safe_send(conn, msg)
+
+    if not ev.wait(timeout):
+        APPEND_WAITERS.pop(req_id, None)
+        raise TimeoutError("api_append_rows_resp timeout")
+
+    APPEND_WAITERS.pop(req_id, None)
+    resp = holder["resp"]
+    if not resp.get("ok"):
+        raise RuntimeError(f"api_append_rows denied: {resp.get('reason')}")
+    return True
+
+
 # ## Logging 
 
-# In[ ]:
+# In[9]:
 
 
 # --- Logging to file so Electron dashboard can read output ---
@@ -256,7 +331,36 @@ print("")
 # ## Messaging Protocols
 # 
 
-# In[ ]:
+# In[10]:
+
+
+def json_default(o):
+    # numpy scalars
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, (np.bool_,)):
+        return bool(o)
+    # numpy arrays
+    if isinstance(o, (np.ndarray,)):
+        return o.tolist()
+    # pandas types
+    if isinstance(o, (pd.Timestamp,)):
+        return o.isoformat()
+    if isinstance(o, (pd.Timedelta,)):
+        return str(o)
+    # python datetime
+    if isinstance(o, (datetime.datetime, datetime.date)):
+        return o.isoformat()
+    # bytes
+    if isinstance(o, (bytes, bytearray)):
+        return o.decode("utf-8", errors="replace")
+    # fallback
+    return str(o)
+
+
+# In[11]:
 
 
 def get_machine_uid():
@@ -275,7 +379,7 @@ def get_machine_uid():
 #get_machine_uid()
 
 
-# In[ ]:
+# In[12]:
 
 
 def get_ip_address():
@@ -290,7 +394,7 @@ def get_ip_address():
 
 
 
-# In[ ]:
+# In[13]:
 
 
 '''
@@ -322,16 +426,17 @@ def deserialize_dataframes(encoded_list):
     return deserialized
 
 
-# In[ ]:
+# In[14]:
 
 
 def send_message(conn, message_dict):
-    message_bytes = json.dumps(message_dict).encode()
+    #message_bytes = json.dumps(message_dict).encode()
+    message_bytes = json.dumps(message_dict, default=json_default).encode()
     length_prefix = len(message_bytes).to_bytes(4, byteorder='big')  # 4-byte length
     conn.sendall(length_prefix + message_bytes)
 
 
-# In[ ]:
+# In[15]:
 
 
 '''
@@ -356,7 +461,7 @@ def safe_send(conn, payload):
         send_message(conn, payload)
 
 
-# In[ ]:
+# In[16]:
 
 
 def recv_message(sock):
@@ -442,7 +547,7 @@ def recvall(sock, n):
 
 # # FE Imprinting Code
 
-# In[ ]:
+# In[17]:
 
 
 def perform_core_FE(data):
@@ -496,7 +601,7 @@ def perform_core_FE(data):
     return FE
 
 
-# In[ ]:
+# In[18]:
 
 
 def process_sub_df(sub_df, resample_timeframe):
@@ -560,9 +665,899 @@ def process_sub_df(sub_df, resample_timeframe):
         return pd.DataFrame()  # Return an empty DataFrame on error
 
 
-# # Slave Code
+# # Backtesting
 
 # In[ ]:
+
+
+
+
+
+# In[19]:
+
+
+def align_results(long_headers, short_headers, long_values, short_values):
+    """
+    Align long and short results using an order-preserving merged header,
+    and map original values correctly based on header-value pairs.
+    """
+
+    # Step 1: Build a unified header based on earliest appearance index
+    header_index_map = {}
+    for i, h in enumerate(long_headers):
+        if h not in header_index_map:
+            header_index_map[h] = i
+    for i, h in enumerate(short_headers):
+        if h not in header_index_map:
+            header_index_map[h] = i
+
+    all_headers = list(dict.fromkeys(long_headers + short_headers))
+    final_header = sorted(all_headers, key=lambda h: header_index_map[h])
+
+    # Step 2: Use correct maps from original header-value pairings
+    long_map = dict(zip(long_headers, long_values))
+    short_map = dict(zip(short_headers, short_values))
+
+    # Step 3: Align values to final header
+    aligned_long_values = [long_map.get(h, np.nan) for h in final_header]
+    aligned_short_values = [short_map.get(h, np.nan) for h in final_header]
+
+    return final_header, aligned_long_values, aligned_short_values
+
+
+# In[20]:
+
+
+def create_long_strategy_class(Strategy, tm_parameters, slippage, signal_col):
+    # Only Long Strategy
+    class LongStrat(Strategy):
+        initial_cash = tm_parameters['initial_cash']
+        risk_per_trade = tm_parameters['risk_per_trade']
+        max_loss = risk_per_trade * initial_cash
+        
+        sl_coeff = 0.01*tm_parameters['stop_loss']
+        tp_coeff = 0.01*tm_parameters['take_profit']
+        
+        def init(self):
+            super().init()
+            #self.signal1 = self.I(SIGNAL)
+            self.signal1 = self.I(lambda: self.data.df[signal_col].to_numpy())
+            self.max_loss = self.risk_per_trade * self.initial_cash
+        
+            # Maintiain order book
+            self.order_data = {}  # Dictionary to store order and their specific stop losses
+        
+        
+        def finalize(self):
+            # This method is called after the last bar
+            print("Finalizing the strategy. Closing all positions.")
+            self.position.close()
+            # Close all active trades
+            for trade in self.trades:
+                if trade.exit_price == None:
+                    trade.close(portion=1.0)
+        
+        def next(self):
+            super().next()
+        
+            # Entry price with Slippage
+            prev_close = self.data.Close[-1]
+            slippage_buffer =  slippage * prev_close
+            expected_entry_price = prev_close + slippage_buffer
+                               
+            #Trade Size Calculation with max_loss
+            expected_loss_per_unit = self.sl_coeff*expected_entry_price
+            self.trade_size = self.max_loss/expected_loss_per_unit
+
+            
+        
+            # Rounding off Trade_size
+            if self.trade_size > 1 :
+                self.trade_size = round(self.trade_size)
+            elif self.trade_size > 0 and self.trade_size < 1:
+                self.trade_size = round(self.trade_size,4)
+        
+            # Buy Signal
+            #if self.signal1==2:
+            if self.signal1[-1] == 2:
+        
+                # Calculate Stop Loss
+                sl1 = (1 - self.sl_coeff) * expected_entry_price #- 3000e-4 #45e-4
+        
+                # Calculate Take Profit
+                tp1 = (1 + self.tp_coeff) * expected_entry_price #+ 45e-4 #45
+        
+                # Place Long Order
+                order = self.buy( limit = expected_entry_price , sl=sl1 , tp=tp1 , size=self.trade_size)
+                order_id = id(order)  # Using id() to generate a unique identifier
+                # Adding to order book 
+                self.order_data[order_id] = {'order': order, 'stop': self.data.Close[-1] * (1 - self.sl_coeff), 'type': 'long'}
+        
+    return LongStrat
+
+
+# In[21]:
+
+
+def create_short_strategy_class(Strategy, tm_parameters,slippage, signal_col):
+    # Only Short Strategy
+    class ShortStrat(Strategy):
+        initial_cash = tm_parameters['initial_cash']
+        risk_per_trade = tm_parameters['risk_per_trade']
+        max_loss = risk_per_trade * initial_cash
+        
+        sl_coeff = 0.01*tm_parameters['stop_loss']
+        tp_coeff = 0.01*tm_parameters['take_profit']
+        
+        def init(self):
+            super().init()
+            #self.signal1 = self.I(SIGNAL)
+            self.signal1 = self.I(lambda: self.data.df[signal_col].to_numpy())
+            self.max_loss = self.risk_per_trade * self.initial_cash
+        
+            # Maintiain order book
+            self.order_data = {}  # Dictionary to store order and their specific stop losses
+        
+                        
+        
+        def finalize(self):
+            # This method is called after the last bar
+            print("Finalizing the strategy. Closing all positions.")
+            self.position.close()
+            # Close all active trades
+            for trade in self.trades:
+                if trade.exit_price == None:
+                    trade.close(portion=1.0)
+        
+        def next(self):
+            super().next()
+                            
+            # Entry price with Slippage
+            prev_close = self.data.Close[-1]
+            slippage_buffer =  slippage * prev_close
+            expected_entry_price = prev_close - slippage_buffer
+        
+            #Trade Size Calculation with max_loss
+            expected_loss_per_unit = self.sl_coeff*expected_entry_price
+            self.trade_size = self.max_loss/expected_loss_per_unit
+                            
+             
+            # Rounding off Trade_size
+            if self.trade_size > 1 :
+                self.trade_size = round(self.trade_size)
+            elif self.trade_size > 0 and self.trade_size < 1:
+                self.trade_size = round(self.trade_size,4)
+        
+            # Sell Signal
+            #if self.signal1==1 :
+            if self.signal1[-1]==1 :
+        
+                # Calculate Stop Loss
+                sl1 = (1 + self.sl_coeff) * expected_entry_price #+ 3000e-4 #45e-4
+        
+                # Calculate Take Profit
+                tp1 = (1 - self.tp_coeff) * expected_entry_price #- 45e-4 #45
+        
+                # Placing Sell Order
+                order = self.sell(limit = expected_entry_price , sl=sl1, tp=tp1, size=self.trade_size)
+                order_id = id(order)  # Using id() to generate a unique identifier
+                    
+                # Adding to order book 
+                self.order_data[order_id] = {'order': order, 'stop': self.data.Close[-1] * (1 + self.sl_coeff), 'type': 'short'}
+        
+    return ShortStrat    
+
+
+# In[22]:
+
+
+def api_update_gridsignal(conn, slave_id, work_id, token, grid_file, lock_file, row, column, new_flag):
+    safe_send(conn, {
+        "command": "api_write",
+        "slave_id": slave_id,
+        "work_id": work_id,
+        "token": token,
+        "op": "update_gridsignal",
+        "data": {
+            "grid_file": grid_file,
+            "lock_file": lock_file,
+            "row": row,
+            "column": column,
+            "new_flag": new_flag
+        }
+    })
+
+
+# In[23]:
+
+
+# Strategy calls this signal
+def SIGNAL():
+  return dfpl[signal_name]
+
+def periodic_raw_analysis(period,periodic_frames,root_folder,signal_name,tm_parameters,
+                          base_header,base_value,Long_Strategy,Short_Strategy,verbose=True,
+                          conn=None, slave_id=None, work_id=None, api_token=None, dir_name=None,
+                          allowed_output_prefix= None
+                         ):
+
+  #root_folder = Path(root_folder)
+    
+  # Pre-Req
+  periodic_results = []
+  periodic_LR=[]
+  periodic_SR=[]
+  counter = 0
+  total_periods = len(periodic_frames)
+
+  initial_cash = tm_parameters['initial_cash']
+  comission = tm_parameters['comission']
+  leverage = tm_parameters['leverage']
+  risk_per_trade = tm_parameters['risk_per_trade']
+
+  if period == 'M':
+    periodically_string  = 'Monthly'
+    period_string = 'Month'
+  elif period == 'W':
+    periodically_string  = 'Weekly'
+    period_string = 'Week'
+  elif period == 'D':
+    periodically_string  = 'Daily'
+    period_string = 'Day'
+
+
+  # Create Folder for Periodic Analysis
+  periodic_analysis_folder = root_folder+f'{periodically_string}_Analysis/'
+  if not os.path.exists(periodic_analysis_folder):
+      os.makedirs(periodic_analysis_folder, exist_ok=True)
+
+  # Perform Period Analysis
+  for dfpl in periodic_frames:
+
+      # Increment Counter
+      counter = counter + 1
+
+      # Create Folder for Current Periodic Analysis
+      counter_period = f'{period_string}{counter}'
+      counter_period_folder = periodic_analysis_folder+f'{counter_period}/'
+      if not os.path.exists(counter_period_folder):
+          os.makedirs(counter_period_folder, exist_ok=True)
+
+      # Periodic headers and Values for results
+      periodic_header = ['Analysis Period','Current Period','Current Period Counter','Total Periods Count','Folder Path']
+      periodic_value = [period_string,counter_period,counter,total_periods,counter_period_folder]
+
+      # Count Long, Shorts and Hedge Trades
+      count_longs = (dfpl[signal_name] == 2).sum()
+      count_shorts = (dfpl[signal_name] == 1).sum()
+      count_trades = count_longs + count_shorts
+
+      # Strategy calls this signal
+      def new_SIGNAL_function():
+        return dfpl[signal_name]
+          
+      # Redefine the SIGNAL function
+      global SIGNAL
+      SIGNAL = new_SIGNAL_function
+      if verbose:
+          print('______________________________________')
+          print('Iteration : ',counter,'/',total_periods,f' {period_string}s')
+          print('Name:',signal_name)
+
+
+      # BackTesting Long Strategy
+      bt_long = Backtest(dfpl, Long_Strategy, cash = initial_cash, margin=1/leverage, commission=comission,exclusive_orders=False)
+      stat_long = bt_long.run()
+      
+      #print('Backtesting Performed !')
+      # save long plot file
+      long_plot_file_name = counter_period_folder + 'long_plot'
+      '''
+      bt_long.plot( results = stat_long, filename=long_plot_file_name, plot_width=None, plot_equity=True, plot_return=True, plot_pl=True, plot_volume=True, plot_drawdown=False, smooth_equity=False, relative_equity=True, superimpose=True, resample=True, reverse_indicators=False, show_legend=True,open_browser=False)
+      '''
+      #print('Plot Saved')
+      
+      # count long trades
+      if count_longs != 0:
+          long_trade_captured = stat_long['# Trades']/count_longs
+      elif count_longs==0 and stat_long['# Trades']==0:
+          long_trade_captured = 1
+      else:
+          long_trade_captured = 0
+          
+      # Save Equity Curve
+      long_equity_curve_file_name = counter_period_folder + 'long_equity_curve.csv.gz'
+      #stat_long._equity_curve.to_csv(long_equity_curve_file_name)
+      #safe_write_dataframe(stat_long._equity_curve, long_equity_curve_file_name, compression="gzip")
+      api_write_df_csv_gz(conn, slave_id, work_id, api_token, dir_name, stat_long._equity_curve, long_equity_curve_file_name, index=True, allowed_output_prefix= allowed_output_prefix)
+      
+      #print('Equity CSV Saved')
+      
+      # Save Trades
+      long_trades_file_name = counter_period_folder + 'long_trades.csv.gz'
+      #stat_long._trades.to_csv(long_trades_file_name)
+      #safe_write_dataframe(stat_long._trades, long_trades_file_name, compression="gzip")
+      api_write_df_csv_gz(conn, slave_id, work_id, api_token, dir_name, stat_long._trades, long_trades_file_name, index=True, allowed_output_prefix= allowed_output_prefix)
+
+      #print('Stat CSV Saved')
+      
+      # Collect Long Values
+      long_headers = ['Trade Direction','Strategy','Plot File','trade_captured','trade_captured [%]','available_trade']
+      long_values = ['Long','LongStrat',long_plot_file_name,long_trade_captured,long_trade_captured*100,count_longs]
+      for item in (list(stat_long.items())):
+          if item[0] not in ['_strategy', '_equity_curve', '_trades']:
+              long_headers.append(item[0])
+              long_values.append(item[1])
+          elif item[0] == '_strategy':
+              long_headers.append(item[0])
+              long_values.append(item[1])
+          elif item[0] == '_equity_curve':
+              long_headers.append(item[0])
+              long_values.append(long_equity_curve_file_name)
+          elif item[0] == '_trades':
+              long_headers.append(item[0])
+              long_values.append(long_trades_file_name)
+
+      # Build Long Results
+      long_results_headers = base_header + periodic_header + long_headers
+      long_results = base_value + periodic_value + long_values
+
+      if verbose:
+          # Print BackTesting Long Strategy Results
+          print('______________________________________')
+          print('Trade Parameter ',tm_parameters['name'])
+          print('Name:',signal_name)
+          print(stat_long['# Trades'],'/',count_longs,' Long Trades Placed')
+          print(' Long Trades Captured : ',long_trade_captured)
+          print('                      : ',long_trade_captured*100 , '%')
+          print('Long Plot saved to file:', long_plot_file_name)
+          print('Long Stats:')
+          print(stat_long)
+
+
+      # BackTesting Short Strategy
+      bt_short = Backtest(dfpl, Short_Strategy, cash = initial_cash, margin=1/leverage, commission=comission,exclusive_orders=False)
+      stat_short = bt_short.run()
+      
+      
+      # save short plot file
+      short_plot_file_name = counter_period_folder+'short_plot'
+      '''
+      bt_short.plot( results=stat_short, filename=short_plot_file_name, plot_width=None, plot_equity=True, plot_return=True, plot_pl=True, plot_volume=True, plot_drawdown=False, smooth_equity=False, relative_equity=True, superimpose=True, resample=True, reverse_indicators=False, show_legend=True, open_browser=False)
+      '''
+      # count short trades
+      if count_shorts != 0:
+          short_trade_captured = stat_short['# Trades']/count_shorts
+      elif count_shorts == 0 and stat_short['# Trades']==0:
+          short_trade_captured = 1
+      else:
+          short_trade_captured = 0
+          
+      # Save Equity Curve
+      short_equity_curve_file_name = counter_period_folder + 'short_equity_curve.csv.gz'
+      #stat_short._equity_curve.to_csv(short_equity_curve_file_name)
+      #safe_write_dataframe(stat_short._equity_curve, short_equity_curve_file_name, compression="gzip")
+      api_write_df_csv_gz(conn, slave_id, work_id, api_token, dir_name, stat_short._equity_curve, short_equity_curve_file_name, index=True, allowed_output_prefix= allowed_output_prefix)
+
+      # Save Trades
+      short_trades_file_name = counter_period_folder + 'short_trades.csv.gz'
+      #stat_short._trades.to_csv(short_trades_file_name)
+      #safe_write_dataframe(stat_short._trades, short_trades_file_name, compression="gzip")
+      api_write_df_csv_gz(conn, slave_id, work_id, api_token, dir_name, stat_short._trades, short_trades_file_name, index=True, allowed_output_prefix= allowed_output_prefix)
+      
+      
+      # Collect Short Values
+      short_headers = ['Trade Direction','Strategy','Plot File','trade_captured','trade_captured [%]','available_trade']
+      short_values = ['Short','ShortStrat',short_plot_file_name,short_trade_captured,short_trade_captured*100,count_shorts]
+      for item in (list(stat_short.items())):
+          if item[0] not in ['_strategy', '_equity_curve', '_trades']:
+              short_headers.append(item[0])
+              short_values.append(item[1])
+          elif item[0] == '_strategy':
+              short_headers.append(item[0])
+              short_values.append(item[1])
+          elif item[0] == '_equity_curve':
+              short_headers.append(item[0])
+              short_values.append(short_equity_curve_file_name)
+          elif item[0] == '_trades':
+              short_headers.append(item[0])
+              short_values.append(short_trades_file_name)
+
+      # Build Short Results
+      short_results_headers = base_header + periodic_header + short_headers
+      short_results = base_value + periodic_value + short_values
+
+      if verbose:
+          # Print BackTesting Short Strategy Results
+          print('______________________________________')
+          print('Trade Parameter ',tm_parameters['name'])
+          print('Name:',signal_name)
+          print(stat_short['# Trades'],'/',count_shorts,' Short Trades Placed')
+          print(' Short Trades Captured : ',short_trade_captured)
+          print('                      : ',short_trade_captured*100 , '%')
+          print('Short Plot saved to file:', short_plot_file_name)
+          print('Short Stats:')
+          print(stat_short)
+
+
+
+      # Check for header mismatches
+      long_only = [(i, val) for i, val in enumerate(long_results_headers) if val not in short_results_headers]
+      short_only = [(i, val) for i, val in enumerate(short_results_headers) if val not in long_results_headers]
+    
+      if long_only or short_only:
+            # Align headers and values
+            header, new_long_results, new_short_results = align_results(
+                                                                long_results_headers, short_results_headers,
+                                                                long_results, short_results
+                                                            )
+            
+            if verbose:
+                print("\nHeader mismatch detected!")
+                
+                if long_only:
+                    print("\nLong headers not in short:")
+                    for i, val in long_only:
+                        print(f"  Index {i}: {val}")
+                
+                if short_only:
+                    print("\nShort headers not in long:")
+                    for i, val in short_only:
+                        print(f"  Index {i}: {val}")
+                
+                
+                # Print all headers line by line
+                print("\nFinal Aligned Headers:")
+                for i, h in enumerate(header):
+                    print(f"  {i}: {h}")
+            
+                # Print results before and after alignment
+                print("\nOriginal Long Results:")
+                for i, (h, v) in enumerate(zip(long_results_headers, long_results)):
+                    print(f"  {i}: {h} = {v}")
+            
+                print("\nOriginal Short Results:")
+                for i, (h, v) in enumerate(zip(short_results_headers, short_results)):
+                    print(f"  {i}: {h} = {v}")
+            
+                print("\nNew Aligned Long Results:")
+                for i, (h, v) in enumerate(zip(header, new_long_results)):
+                    print(f"  {i}: {h} = {v}")
+            
+                print("\nNew Aligned Short Results:")
+                for i, (h, v) in enumerate(zip(header, new_short_results)):
+                    print(f"  {i}: {h} = {v}")
+
+
+                
+            if len(new_long_results) != len(new_short_results):
+                raise AssertionError('LEN OF NEW : long_results and short_results do not match, this should not occur')
+            else:
+                long_results, short_results = new_long_results, new_short_results
+      else:      
+            #raise AssertionError('long_results_header and short_results_header do not match, this should not occur')
+            assert long_results_headers == short_results_headers, 'long_results_header and short_results_header do not match, this should not occur'
+            header = long_results_headers
+
+      # Save Current Period Results
+      results = [long_results,short_results]
+      #curr_period_results = pd.DataFrame(results, columns=header)
+      curr_period_results_file_name = counter_period_folder + 'results.csv.gz'
+      '''
+      curr_period_results_df = load_existing_and_merge(results, header, curr_period_results_file_name, verbose=verbose)
+      #curr_period_results.to_csv(curr_period_results_file_name, index=False)
+      #safe_write_dataframe(curr_period_results_df, curr_period_results_file_name, index=False, compression="gzip")
+      api_write_df_csv_gz(conn, slave_id, work_id, api_token, dir_name, curr_period_results_df, curr_period_results_file_name, index=False, allowed_output_prefix= allowed_output_prefix)
+      '''
+      api_append_rows_gz(
+            conn, slave_id, work_id, api_token,
+            dir_name=dir_name,
+            abs_path=curr_period_results_file_name,
+            header=header,
+            rows=results,
+            allowed_output_prefix=allowed_output_prefix
+        )
+
+      if verbose:
+          print(f'{period_string} {counter}/{total_periods} Results saved to file:', curr_period_results_file_name)
+
+      # Saving Periodic results
+      periodic_results.append(long_results)
+      periodic_results.append(short_results)
+      #periodic_results_df = pd.DataFrame(periodic_results, columns=header)
+      periodic_results_file_name = periodic_analysis_folder + f'{periodically_string}_results.csv.gz'
+      '''
+      periodic_results_df = load_existing_and_merge([long_results, short_results], header, periodic_results_file_name, verbose=verbose)
+      #periodic_results_df.to_csv(periodic_results_file_name, index=False)
+      #safe_write_dataframe(periodic_results_df, periodic_results_file_name, index=False, compression="gzip")
+      api_write_df_csv_gz(conn, slave_id, work_id, api_token, dir_name, periodic_results_df, periodic_results_file_name, index=False, allowed_output_prefix= allowed_output_prefix)
+      '''
+      api_append_rows_gz(
+            conn, slave_id, work_id, api_token,
+            dir_name=dir_name,
+            abs_path=periodic_results_file_name,
+            header=header,
+            rows=[long_results, short_results],
+            allowed_output_prefix=allowed_output_prefix
+        )
+
+      if verbose:
+          print(f'{periodically_string} Results saved to file:', periodic_results_file_name)
+
+      # Saving Periodic_LR
+      periodic_LR.append(long_results)
+      #periodic_lr_df = pd.DataFrame(periodic_LR, columns=header)
+      periodic_lr_file_name = periodic_analysis_folder + f'{periodically_string}_long_results.csv.gz'
+      '''
+      periodic_lr_df = load_existing_and_merge([long_results], header, periodic_lr_file_name, verbose=verbose)
+      #periodic_lr_df.to_csv(periodic_lr_file_name, index=False)
+      #safe_write_dataframe(periodic_lr_df, periodic_lr_file_name, index=False, compression="gzip")
+      api_write_df_csv_gz(conn, slave_id, work_id, api_token, dir_name, periodic_lr_df, periodic_lr_file_name, index=False, allowed_output_prefix= allowed_output_prefix)
+      '''
+      api_append_rows_gz(
+            conn, slave_id, work_id, api_token,
+            dir_name=dir_name,
+            abs_path=periodic_lr_file_name,
+            header=header,
+            rows=[long_results],
+            allowed_output_prefix=allowed_output_prefix
+        )
+
+      if verbose:
+          print(f'{periodically_string} Long Results saved to file:', periodic_lr_file_name)
+
+      # Saving Periodic_SR
+      periodic_SR.append(short_results)
+      #periodic_sr_df = pd.DataFrame(periodic_SR, columns=header)
+      periodic_sr_file_name = periodic_analysis_folder + f'{periodically_string}_short_results.csv.gz'
+      '''
+      periodic_sr_df = load_existing_and_merge([short_results], header, periodic_sr_file_name, verbose=verbose)
+      #periodic_sr_df.to_csv(periodic_sr_file_name, index=False)
+      #safe_write_dataframe(periodic_sr_df, periodic_sr_file_name, index=False, compression="gzip")
+      api_write_df_csv_gz(conn, slave_id, work_id, api_token, dir_name, periodic_sr_df, periodic_sr_file_name, index=False, allowed_output_prefix= allowed_output_prefix)
+      '''
+      api_append_rows_gz(
+            conn, slave_id, work_id, api_token,
+            dir_name=dir_name,
+            abs_path=periodic_sr_file_name,
+            header=header,
+            rows=[short_results],
+            allowed_output_prefix=allowed_output_prefix
+        )
+
+      if verbose:
+          print(f'{periodically_string} Short Results saved to file:', periodic_sr_file_name)
+
+
+# In[24]:
+
+
+#def perform_backtesting(INPUTS):
+#def perform_backtesting(tm_cache_folder,signal_name, col, flag, tm_parameters,verbose=False):
+def perform_backtesting_remote(BIG_DATA,flag, tm_parameters,verbose=False, conn=None, slave_id=None, work_id=None, api_token=None, allowed_output_prefix=None):
+    '''
+    # 1. Unpack the small pieces from INPUTS
+    base_inputs, backtesting_inputs, verbose = INPUTS
+    analysis_folder,tm_cache_folder = base_inputs  # example structure
+    signal_name, col, flag, tm_parameters = backtesting_inputs
+    '''
+    # 2. Load big data from the global dictionary
+    #global BIG_DATA
+    dir_name = BIG_DATA["dir_name"]
+
+    monthly_frames = BIG_DATA["monthly_frames"]
+    weekly_frames = BIG_DATA["weekly_frames"]
+    daily_frames  = BIG_DATA["daily_frames"]
+    explored_signals_info = BIG_DATA["explored_signals_info"]
+
+    symbol      = BIG_DATA["symbol"]
+    timeframe   = BIG_DATA["timeframe"]
+    analysis_name = BIG_DATA["analysis_name"]
+    periodic_flags = BIG_DATA["PERIODIC_FLAGS"]
+    strategy_name = BIG_DATA["Strategy_Name"]
+
+    
+    '''
+    base_inputs,backtesting_inputs,verbose = INPUTS
+    # Assemble all Pre requisites from input
+    symbol,timeframe,analysis_name,analysis_folder,tm_cache_folder,explored_signals_info,periodic_flags,monthly_frames,weekly_frames,daily_frames = base_inputs
+    signal_name,col,flag,tm_parameters = backtesting_inputs
+    '''
+
+    
+    MONTHLY_ANALYSIS,WEEKLY_ANALYSIS,DAILY_ANALYSIS = periodic_flags
+
+
+    signal_name = tm_parameters['signal_name']
+    #col = tm_parameters['name']
+    
+    # Create Folder for the signal
+    #signal_folder = analysis_folder+signal_name+'/'
+    signal_folder = tm_parameters['analysis_cache_folder']+'/'
+
+    # 
+    tm_cache_folder = tm_parameters['tm_cache_folder']
+
+    #Define Grid Files
+    grid_file = f"{tm_cache_folder}/grid_Signal_TM.csv"
+    lock_grid_file = f"{tm_cache_folder}/grid_Signal_TM.lock"
+
+    
+    # Currently Selected Signal
+    if verbose:
+        print(f"Row /  Indicator : {signal_name}")
+        
+    
+    
+    if not os.path.exists(signal_folder):
+        os.makedirs(signal_folder, exist_ok=True)
+        
+    # Signal Info such as Total Trades, Longs, Shorts
+    '''
+    signal_info = explored_signals_info[explored_signals_info['Signal Name']==signal_name]
+    Total_Trades = signal_info['Trades'].values[0]
+    Total_Longs = signal_info['Longs'].values[0]
+    Total_Shorts = signal_info['Shorts'].values[0]
+    '''
+    if verbose:
+        print('XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX')
+        print(f"Indicator        : {signal_name}")
+        print(f"Trade Management : {tm_parameters['name']}")
+        print(f"Flag             : {flag}")
+
+    # Retrieve Trading Parameter
+    initial_cash = tm_parameters['initial_cash']
+    comission = tm_parameters['comission']
+    leverage = tm_parameters['leverage']
+    risk_per_trade = tm_parameters['risk_per_trade']
+    slippage = tm_parameters['slippage']
+
+    if verbose:
+        print(f"Name            : {tm_parameters['name']}")
+        print(f"Hashed Name     : {tm_parameters['hashed_name']}")
+        print(f"Initial Cash    : {tm_parameters['initial_cash']}")
+        print(f"Comission       : {tm_parameters['comission']}")
+        print(f"Leverage        : {tm_parameters['leverage']}")
+        print(f"Risk Per Trade  : {tm_parameters['risk_per_trade']}")
+        print(f"Stop Loss       : {tm_parameters['stop_loss']}")
+        print(f"Take Profit     : {tm_parameters['take_profit']}")
+        print(f"Slippage        : {tm_parameters['slippage']}")
+        #print(tm_parameters)
+            
+    # Create Folder for Trading Parameter
+    #tm_folder = Path(signal_folder+tm_parameters['hashed_name']+'/')
+    tm_folder = signal_folder+tm_parameters['hashed_name']+'/'
+    if not os.path.exists(tm_folder):
+        os.makedirs(tm_folder, exist_ok=True)
+        if verbose:
+            print('Created Trade Management Directory :',tm_folder)
+    else:
+        if verbose:
+            print('Trade Management Directory already exists at :',tm_folder)
+            
+        
+    # Base Header and Value for Results
+    base_header = ['Symbol','Timeframe','Analysis Type','Signal','Trade Management','TM_hashed','risk_per_trade','stop_loss','take_profit','initial_cash','comission','leverage','slippage']
+    base_value = [symbol,timeframe,analysis_name,signal_name,tm_parameters['name'],tm_parameters['hashed_name'],tm_parameters['risk_per_trade'],tm_parameters['stop_loss'],tm_parameters['take_profit'],initial_cash,comission,leverage,slippage]
+
+    # Case where backtesting has been performed
+    if flag == 3:
+        if verbose:
+            print('---------------------------------')
+            print('Backtesting already done for here')
+        
+    # Case where backtesting has not been performed
+    elif flag < 3:
+        # Print Statement
+        if verbose:
+            print('---------------------------------')
+            print('Performing Backtesting')
+
+        # Define Long Strategy
+        # Create the dynamic LongStrat class inside the worker
+        LongStrat = create_long_strategy_class(Strategy, tm_parameters,slippage, signal_name)
+
+        # Define Short Strategy
+        # Create the dynamic ShortStrat class inside the worker
+        ShortStrat = create_short_strategy_class(Strategy, tm_parameters,slippage, signal_name)
+    
+        verbose =False
+        # MONTHLY ANALYSIS
+        if MONTHLY_ANALYSIS and flag < 1:
+            periodic_raw_analysis(period='M',periodic_frames=monthly_frames,root_folder = tm_folder,signal_name=signal_name,tm_parameters=tm_parameters,base_header=base_header,base_value=base_value,Long_Strategy=LongStrat,Short_Strategy=ShortStrat,verbose=verbose,conn=conn, slave_id=slave_id, work_id=work_id, api_token=api_token, dir_name=dir_name, allowed_output_prefix= allowed_output_prefix)
+            
+            # Update Grid on succesful updation
+            '''
+            grid_Signal_TM = pd.read_csv(analysis_folder+'grid_Signal_TM.csv',index_col=0)
+            grid_Signal_TM.loc[signal_name,tm_parameters['name']] = 1
+            grid_Signal_TM.to_csv(analysis_folder+'grid_Signal_TM.csv')
+            '''
+            new_flag = 1
+            #update_feed = [grid_file,signal_name,tm_parameters['name'],new_flag]
+            #update_gridsignal(update_feed, lock_grid_file)
+            api_update_gridsignal(conn, slave_id, work_id, api_token, grid_file, lock_grid_file, signal_name, tm_parameters['name'], new_flag)
+            
+            # Update Flag
+            flag=1
+        else:
+            if verbose:
+                print('Monthly Analysis already completed or set to OFF')
+
+        # WEEKLY ANALYSIS
+        if WEEKLY_ANALYSIS and flag < 2:
+            periodic_raw_analysis(period='W',periodic_frames=weekly_frames,root_folder = tm_folder,signal_name=signal_name,tm_parameters=tm_parameters,base_header=base_header,base_value=base_value,Long_Strategy=LongStrat,Short_Strategy=ShortStrat,verbose=verbose,conn=conn, slave_id=slave_id, work_id=work_id, api_token=api_token, dir_name=dir_name, allowed_output_prefix= allowed_output_prefix)
+            
+            # Update Grid on succesful updation
+            '''
+            grid_Signal_TM = pd.read_csv(analysis_folder+'grid_Signal_TM.csv',index_col=0)
+            grid_Signal_TM.loc[signal_name,tm_parameters['name']] = 2
+            grid_Signal_TM.to_csv(analysis_folder+'grid_Signal_TM.csv')
+            '''
+            new_flag = 2
+            #update_feed = [grid_file,signal_name,tm_parameters['name'],new_flag]
+            #update_gridsignal(update_feed, lock_grid_file)
+            api_update_gridsignal(conn, slave_id, work_id, api_token, grid_file, lock_grid_file, signal_name, tm_parameters['name'], new_flag)
+            
+            # Update Flag
+            flag=2
+        else:
+            if verbose:
+                print('Weekly Analysis already completed or set to OFF')
+
+        # DAILY ANALYSIS
+        if DAILY_ANALYSIS and flag < 3:
+            periodic_raw_analysis(period='D',periodic_frames=daily_frames,root_folder = tm_folder,signal_name=signal_name,tm_parameters=tm_parameters,base_header=base_header,base_value=base_value,Long_Strategy=LongStrat,Short_Strategy=ShortStrat,verbose=verbose,conn=conn, slave_id=slave_id, work_id=work_id, api_token=api_token, dir_name=dir_name, allowed_output_prefix= allowed_output_prefix)
+            
+            # Update Grid on succesful updation
+            '''
+            grid_Signal_TM = pd.read_csv(analysis_folder+'grid_Signal_TM.csv',index_col=0)
+            grid_Signal_TM.loc[signal_name,tm_parameters['name']] = 3
+            grid_Signal_TM.to_csv(analysis_folder+'grid_Signal_TM.csv')
+            '''
+            new_flag = 3
+            #update_feed = [grid_file,signal_name,tm_parameters['name'],new_flag]
+            #update_gridsignal(update_feed, lock_grid_file)
+            api_update_gridsignal(conn, slave_id, work_id, api_token, grid_file, lock_grid_file, signal_name, tm_parameters['name'], new_flag)
+            
+            # Update Flag
+            flag=3
+        else:
+            if verbose:
+                print('Daily Analysis already completed or set to OFF')
+                        
+        
+
+    
+    else:
+        if verbose:
+            print('Error in grid_Signal_TM')
+    if verbose:
+        print('XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX')
+
+    return True
+
+
+# In[25]:
+
+
+_BIGDATA_CACHE = {}  # sha256 -> big_data dict
+
+def load_big_data_from_ref(big_data_ref: dict) -> dict:
+    # big_data_ref is canonical {bucket,key,sha256,bytes,...} from master
+    sha = big_data_ref.get("sha256") or big_data_ref.get("sha")
+    if sha in _BIGDATA_CACHE:
+        return _BIGDATA_CACHE[sha]
+
+    # Need a presigned url: master should pass presigned via presign_existing_payload() like normal assignments
+    # easiest: master includes presigned url inside payload, but you can also add a command to refresh it.
+    payload = fetch_payload_ref({"url": big_data_ref["url"], "sha256": big_data_ref["sha256"], "bytes": big_data_ref["bytes"], "compression": "zstd"})
+    if payload.get("kind") != "big_data_pickle_b64":
+        raise ValueError("Unexpected BIG_DATA payload kind")
+
+    blob = base64.b64decode(payload["pickle_b64"])
+    big_data = pickle.loads(blob)
+    _BIGDATA_CACHE[sha] = big_data
+    return big_data
+
+
+# In[26]:
+
+
+PRESIGN_WAITERS = {}  # req_id -> (Event, holder)
+UPLOAD_MAX_CONCURRENCY = 50
+_UPLOAD_SEM = threading.Semaphore(UPLOAD_MAX_CONCURRENCY)
+
+def request_presigned_put(conn, slave_id, work_id, token, rel_path, content_type, size=None, sha256=None, timeout=600):
+    req_id = uuid.uuid4().hex
+    req = {
+        "command": "api_presign_put",
+        "slave_id": slave_id,
+        "work_id": work_id,
+        "token": token,
+        "req_id": req_id,
+        "rel_path": rel_path,
+        "content_type": content_type,
+        "size": size,
+        "sha256": sha256,
+    }
+
+    # Wait for response (simple per-work event)
+    ev = threading.Event()
+    holder = {"resp": None}
+    PRESIGN_WAITERS[req_id] = (ev, holder)
+
+    safe_send(conn, req)
+
+    if not ev.wait(timeout):
+        PRESIGN_WAITERS.pop(req_id, None)
+        raise TimeoutError("api_presign_put_resp timeout")
+
+    PRESIGN_WAITERS.pop(req_id, None)
+    resp = holder["resp"]
+    if not resp.get("ok"):
+        raise PermissionError(f"presign denied: {resp.get('reason')}")
+    return resp
+
+def upload_bytes_to_presigned_put(put_url, headers, data_bytes):
+    #r = requests.put(put_url, data=data_bytes, headers=headers, timeout=(30, 900))
+    with _UPLOAD_SEM:
+        r = _HTTP.put(put_url, data=data_bytes, headers=headers, timeout=(30, 3600))
+        r.raise_for_status()
+
+
+# In[27]:
+
+
+def to_rel_path_under_run(abs_path: str, dir_name: str) -> str:
+    p = abs_path.replace("\\", "/")
+    root = dir_name.replace("\\", "/").rstrip("/") + "/"
+    if not p.startswith(root):
+        # if this happens, you can either deny or fallback to best-effort relative
+        raise ValueError(f"path {p} not under run root {root}")
+    rel = p[len(root):]
+    # rel path as master expects: RUN_ROOT_REL + rel
+    # master’s allowed prefix is RUN_ROOT_REL (dir_name relative), so slave must send full rel under that.
+    # easiest: send RUN_ROOT_REL + rel, but RUN_ROOT_REL is exactly the dir_name relative.
+    # so return "<RUN_ROOT_REL>/<rel>" is done by master; here just return that root-relative.
+    return rel.replace("//", "/")
+
+def api_write_df_csv_gz(conn, slave_id, work_id, token, dir_name, df: pd.DataFrame, abs_path: str,
+                        index=False, allowed_output_prefix= None):
+    # create gzip bytes exactly like df.to_csv(..., compression="gzip") would
+    buf = io.StringIO()
+    df.to_csv(buf, index=index)
+    raw = buf.getvalue().encode("utf-8")
+    gz = io.BytesIO()
+    with gzip.GzipFile(fileobj=gz, mode="wb") as f:
+        f.write(raw)
+    data_bytes = gz.getvalue()
+
+    rel = to_rel_path_under_run(abs_path, dir_name)
+    # include run-root relative prefix in rel_path:
+    # easiest: store RUN_ROOT_REL in work_data or passed kwargs; here assume work_data includes "run_root_rel".
+    rel_path = f"{allowed_output_prefix.rstrip('/')}/{rel}"
+
+    resp = request_presigned_put(conn, slave_id, work_id, token, rel_path, "application/gzip", size=len(data_bytes))
+    upload_bytes_to_presigned_put(resp["put_url"], resp.get("headers", {}), data_bytes)
+
+def api_write_pickle(conn, slave_id, work_id, token, dir_name, obj, abs_path: str, allowed_output_prefix= None):
+    data_bytes = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    rel = to_rel_path_under_run(abs_path, dir_name)
+    rel_path = f"{allowed_output_prefix.rstrip('/')}/{rel}"
+    resp = request_presigned_put(conn, slave_id, work_id, token, rel_path, "application/octet-stream", size=len(data_bytes))
+    upload_bytes_to_presigned_put(resp["put_url"], resp.get("headers", {}), data_bytes)
+
+def api_write_text(conn, slave_id, work_id, token, dir_name, text: str, abs_path: str, content_type="text/plain; charset=utf-8", allowed_output_prefix=None):
+    data_bytes = text.encode("utf-8")
+    rel = to_rel_path_under_run(abs_path, dir_name)
+    rel_path = f"{allowed_output_prefix.rstrip('/')}/{rel}"
+    resp = request_presigned_put(conn, slave_id, work_id, token, rel_path, content_type, size=len(data_bytes))
+    upload_bytes_to_presigned_put(resp["put_url"], resp.get("headers", {}), data_bytes)
+
+
+# # Slave Code
+
+# In[28]:
 
 
 def is_domain(host: str) -> bool:
@@ -582,7 +1577,7 @@ def is_domain(host: str) -> bool:
         return bool(re.search(r'\.[a-zA-Z]{2,}$', host))
 
 
-# In[ ]:
+# In[29]:
 
 
 '''
@@ -604,7 +1599,7 @@ def heartbeat_sender(conn, work_id, work_name, get_progress):
 '''
 
 
-# In[ ]:
+# In[30]:
 
 
 def heartbeat_sender(conn, work_id, work_name, get_progress, stop_event):
@@ -651,7 +1646,7 @@ def get_progress():
         return (completed.value / total_subtasks) * 100
 
 
-# In[ ]:
+# In[31]:
 
 
 def init_child(shared_completed):
@@ -692,10 +1687,10 @@ def process_wrapper(input_df,input_resample_timeframe):
         return pd.DataFrame()
 
 
-# In[ ]:
+# In[38]:
 
 
-def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_shares):
+def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_shares,api_token=None, token_expiry_unix=None, allowed_output_prefix=None):
     global buffer_cores
     global completed
     global total_subtasks
@@ -719,6 +1714,8 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
 
     
     try:
+
+        # FE IMPRINTING WORK TYPE
         if work_type == "FE_Imprinting":
             # Assume work_data contains sub_dfs and a function reference to process
             # For real cases, work_data may need to be deserialized safely
@@ -742,52 +1739,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             # --- Progress tracking ---
             total_subtasks = len(Inputs)
             completed = mp.Value('i', 0)  # Shared counter
-            '''
-            def process_wrapper(input_df,input_resample_timeframe):
-                
-                # --- TYPE CHECKS ---
-                if not isinstance(input_df, pd.DataFrame):
-                    print(f"[ERROR] process_wrapper: Expected DataFrame for input_df but got {type(input_df)}")
-                    raise TypeError(f"Invalid input_df type: {type(input_df)}")
-        
-                if not isinstance(input_resample_timeframe, str):
-                    print(f"[ERROR] process_wrapper: Expected str for input_resample_timeframe but got {type(input_resample_timeframe)}")
-                    raise TypeError(f"Invalid input_resample_timeframe type: {type(input_resample_timeframe)}")
-
-                # --- ACTUAL PROCESSING ---
-                res = process_sub_df(input_df,input_resample_timeframe)
-                
-                # --- UPDATE PROGRESS ---
-                with completed.get_lock():
-                    completed.value += 1
-                return res
-            '''
-            '''
-            def init_child(shared_completed):
-                global completed
-                completed = shared_completed
-            ''' 
-            '''
-            def heartbeat_sender(conn, work_id, work_name, get_progress):
-                try:
-                    while True:
-                        time.sleep(10)  # Heartbeat interval (seconds)
-                        progress = get_progress()
-                        message = {
-                            "slave_id": slave_id,
-                            "work_id": work_id,
-                            "work_name": work_name,
-                            "stream_type": "progress_update",
-                            "progress_percent": progress
-                        }
-                        send_message(conn, message)
-                except Exception as e:
-                    print(f"[HEARTBEAT] Heartbeat sender stopped: {e}")
-                        
-            def get_progress():
-                with completed.get_lock():
-                    return (completed.value / total_subtasks) * 100
-            '''
+            
             # --- Start Heartbeat ---
             stop_event = threading.Event()
             heartbeat_thread = threading.Thread(
@@ -824,14 +1776,6 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             
 
             # --- Start Watchdog ---
-            '''
-            def watchdog():
-                time.sleep(6000)  # 10 minutes timeout
-                print("[WATCHDOG] Work timeout reached. Force killing slave.")
-                #os._exit(1)
-            
-            threading.Thread(target=watchdog, daemon=True).start()
-            '''
             watchdog_stop_event = threading.Event()
             def watchdog():
                 timeout_sec = 6000  # 10 minutes
@@ -875,11 +1819,6 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
                         #conn.close()
 
 
-            '''
-            # Create a pool of workers, leaving 3 cores free
-            with Pool(processes=pool_size) as pool:
-                final_results = pool.starmap(process_sub_df, sub_dfs)
-            '''
             if len(final_results) == len(Inputs):
                 work_success = True
             else:
@@ -888,6 +1827,126 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
                 print(f"[WORK] Expected Count : {len(Inputs)} | Got Count :{len(final_results)}")
 
 
+
+
+
+
+
+
+        # BACKTESTING WORK TYPE
+        elif work_type == "Backtesting":
+            big_data_ref = work_data["big_data_ref"]
+            tasks = work_data["tasks"]  # list of (flag, tm_parameters, verbose)
+            write_token = api_token
+        
+            # NOTE: big_data_ref coming from master should include a presigned URL, same as normal payload_ref.
+            # If you store canonical in master, pass presigned via presign_existing_payload() :contentReference[oaicite:17]{index=17}
+            big_data = load_big_data_from_ref(big_data_ref)
+        
+            total_subtasks = len(tasks)
+            completed = mp.Value('i', 0)
+        
+            stop_event = threading.Event()
+            heartbeat_thread = threading.Thread(
+                target=heartbeat_sender,
+                args=(conn, work_id, work_name, get_progress, stop_event),
+                daemon=True
+            )
+            heartbeat_thread.start()
+
+            # --- Start Progress Bar ---
+            progress_bar = tqdm(total=total_subtasks, desc=f"Slave {slave_id} Progress", position=0, leave=True)
+            progress_stop_event = threading.Event()
+            
+            def progress_updater():
+                last_completed = 0
+                try:
+                    while not progress_stop_event.is_set():
+                        time.sleep(0.5)  # Update progress every half-second
+                        with completed.get_lock():
+                            current = completed.value
+                        delta = current - last_completed
+                        if delta > 0:
+                            progress_bar.update(delta)
+                            last_completed = current
+                        if current >= total_subtasks:
+                            break
+                except Exception as e:
+                    print(f"[TQDM] Progress updater error: {e}")
+            
+            progress_thread = threading.Thread(target=progress_updater, daemon=True)
+            progress_thread.start()
+
+
+            
+
+            # --- Start Watchdog ---
+            watchdog_stop_event = threading.Event()
+            def watchdog():
+                timeout_sec = 6000  # 10 minutes
+                start_time = time.time()
+                try:
+                    while not watchdog_stop_event.is_set():
+                        if time.time() - start_time > timeout_sec:
+                            print("[WATCHDOG] Work timeout reached. Force killing slave.")
+                            os._exit(1)
+                            break
+                        time.sleep(5)  # Check every 5 seconds
+                except Exception as e:
+                    print(f"[WATCHDOG] Watchdog error: {e}")
+
+
+            watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+            watchdog_thread.start()
+        
+            # Choose pool size similar to your FE logic
+            total_cores = psutil.cpu_count(logical=True)
+            cpu_usage = psutil.cpu_percent(interval=1)
+            available_cores = int((100 - cpu_usage) / 100 * total_cores)
+            pool_size = max(1, min(available_cores - buffer_cores, total_subtasks))
+
+            '''
+            def bt_wrapper(flag, tm_params, verbose):
+                # CALL YOUR EXISTING perform_backtesting LOGIC,
+                # but rewritten as a pure function that uses `big_data` instead of global BIG_DATA.
+                ok = perform_backtesting_remote(big_data, flag, tm_params, verbose, conn, slave_id, work_id, write_token, allowed_output_prefix)
+                with completed.get_lock():
+                    completed.value += 1
+                return ok
+        
+            with mp.Pool(processes=pool_size) as pool:
+                final_results = pool.starmap(bt_wrapper, tasks)
+        
+            work_success = all(final_results)
+            '''
+            def run_one(task):
+                flag, tm_params, verbose = task
+                try:
+                    return perform_backtesting_remote(
+                        big_data, flag, tm_params, verbose,
+                        conn=conn, slave_id=slave_id, work_id=work_id,
+                        api_token=api_token,
+                        allowed_output_prefix=allowed_output_prefix
+                    )
+                except Exception as e:
+                    print(f"[BT][ERROR] work_id={work_id} tm={getattr(tm_params,'get',lambda k, d=None: d)('name',None)} err={e}")
+                    traceback.print_exc()
+                    return False
+                finally:
+                    with completed.get_lock():
+                        completed.value += 1
+
+            
+            with ThreadPoolExecutor(max_workers=pool_size) as ex:
+                futures = [ex.submit(run_one, t) for t in tasks]
+                final_results = [f.result() for f in futures]
+            
+            work_success = all(final_results)
+        
+
+
+
+        # UNKNOWN WORK TYPE
         else:
             # Handle other work types here
             print(f"[WORK] Strange {work_id}: {work_name} ({work_type} not identified)")
@@ -898,8 +1957,18 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
         final_results = f"Error while processing {work_id}: {str(e)}"
         #conn.close()
 
+
+
+    if work_type == "Backtesting":
+        result_payload = {"ok": work_success, "count": len(final_results)}
+    elif work_type == "FE_Imprinting":
+        result_payload = serialize_dataframes(final_results)
+
+
+
     
     slave_end_time = int(time.time() * 1000)  # Finished actual work
+
     
     slave_send_time = int(time.time() * 1000)  # Time right before sending back
     
@@ -910,7 +1979,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
                     "work_type": work_type,
                     "stream_type": "final_result",
                     "work_success": work_success,
-                    "result": serialize_dataframes(final_results), 
+                    "result": result_payload, 
 
                     # Timing Info
                     "slave_receive_time": slave_receive_time,
@@ -1046,7 +2115,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     while not connected:
         try:
             
-            '''
+    '''
     '''
             #client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             #client.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1054,7 +2123,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
             #client.connect((master_ip, master_port))
             #send_message(client, handshake)
             #print(f"[SLAVE] Connected to master at {master_ip}:{master_port}")
-            '''
+    '''
     '''     
             # Step 1: TCP connection
             raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1236,8 +2305,12 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                 except Exception as e:
                     print(f"[ERROR] JSON decode failed: {e}")
                     continue  # don't crash the whole connection
-                if msg.get('command')!='request_sys_info':
+
+                '''
+                if msg.get('command') !='request_sys_info' and msg.get('command')!='api_append_rows_resp' and msg.get('command')!='api_append_rows_resp':
                     print(f"[SLAVE][DISPATCH] command={msg.get('command')} stream_type={msg.get('stream_type')}")
+                '''
+                
                 
                 if msg.get("command") == "assign_id":
                     slave_id = msg["slave_id"]
@@ -1295,7 +2368,9 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     work_shares = msg["work_shares"]
                     total_shares = msg["total_shares"]
 
-
+                    api_token = msg.get("api_token")
+                    token_expiry_unix = msg.get("token_expiry_unix")
+                    allowed_output_prefix = msg.get("allowed_output_prefix")
                     
 
                     '''
@@ -1342,13 +2417,34 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     threading.Thread(
                         target=do_work,
                         args=(client, work_id, work_name, work_type, work_data, work_shares, total_shares),
+                        kwargs={
+                            "api_token": api_token,
+                            "token_expiry_unix": token_expiry_unix,
+                            "allowed_output_prefix": allowed_output_prefix,
+                        },
                         daemon=True
                     ).start()
 
 
 
+                elif msg.get("command") == "api_presign_put_resp":
+                    rid = msg.get("req_id")
+                    waiter = PRESIGN_WAITERS.get(rid)
+                    if waiter:
+                        ev, holder = waiter
+                        holder["resp"] = msg
+                        ev.set()
+                    continue
 
-
+                elif msg.get("command") == "api_append_rows_resp":
+                    rid = msg.get("req_id")
+                    waiter = APPEND_WAITERS.get(rid)
+                    if waiter:
+                        ev, holder = waiter
+                        holder["resp"] = msg
+                        ev.set()
+                    continue
+                
 
                     
                 elif msg.get("stream_type") == "final_result_ack":
