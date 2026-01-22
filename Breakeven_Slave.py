@@ -920,9 +920,10 @@ def periodic_raw_analysis(period,periodic_frames,root_folder,signal_name,tm_para
       # Create Folder for Current Periodic Analysis
       counter_period = f'{period_string}{counter}'
       counter_period_folder = periodic_analysis_folder+f'{counter_period}/'
+      '''
       if not os.path.exists(counter_period_folder):
           os.makedirs(counter_period_folder, exist_ok=True)
-
+      '''
       # Periodic headers and Values for results
       periodic_header = ['Analysis Period','Current Period','Current Period Counter','Total Periods Count','Folder Path']
       periodic_value = [period_string,counter_period,counter,total_periods,counter_period_folder]
@@ -1288,10 +1289,10 @@ def perform_backtesting_remote(BIG_DATA,flag, tm_parameters,verbose=False, conn=
         print(f"Row /  Indicator : {signal_name}")
         
     
-    
+    '''
     if not os.path.exists(signal_folder):
         os.makedirs(signal_folder, exist_ok=True)
-        
+    '''    
     # Signal Info such as Total Trades, Longs, Shorts
     '''
     signal_info = explored_signals_info[explored_signals_info['Signal Name']==signal_name]
@@ -1327,6 +1328,7 @@ def perform_backtesting_remote(BIG_DATA,flag, tm_parameters,verbose=False, conn=
     # Create Folder for Trading Parameter
     #tm_folder = Path(signal_folder+tm_parameters['hashed_name']+'/')
     tm_folder = signal_folder+tm_parameters['hashed_name']+'/'
+    '''
     if not os.path.exists(tm_folder):
         os.makedirs(tm_folder, exist_ok=True)
         if verbose:
@@ -1334,7 +1336,7 @@ def perform_backtesting_remote(BIG_DATA,flag, tm_parameters,verbose=False, conn=
     else:
         if verbose:
             print('Trade Management Directory already exists at :',tm_folder)
-            
+    '''     
         
     # Base Header and Value for Results
     base_header = ['Symbol','Timeframe','Analysis Type','Signal','Trade Management','TM_hashed','risk_per_trade','stop_loss','take_profit','initial_cash','comission','leverage','slippage']
