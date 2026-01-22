@@ -59,14 +59,14 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash -l {0}
         run: |
-          python -m PyInstaller --onefile Breakeven_Slave.py             --name Breakeven_Slave             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
+          python -m PyInstaller --onefile Breakeven_Slave.py             --name Breakeven_Slave             --collect-data backtesting             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
 
       - name: Build (macOS .app zip)
         if: runner.os == 'macOS'
         shell: bash -l {0}
         run: |
           # Build an app bundle (onedir on macOS produces dist/Breakeven_Slave.app)
-          python -m PyInstaller --onedir --windowed Breakeven_Slave.py             --name Breakeven_Slave             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
+          python -m PyInstaller --onedir --windowed Breakeven_Slave.py             --name Breakeven_Slave             --collect-data backtesting             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
 
           # Zip the .app for easy distribution
           ditto -c -k --sequesterRsrc --keepParent "dist/Breakeven_Slave.app" "dist/Breakeven_Slave.app.zip"
@@ -75,7 +75,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash -l {0}
         run: |
-          python -m PyInstaller --onefile Breakeven_Slave.py             --name Breakeven_Slave             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
+          python -m PyInstaller --onefile Breakeven_Slave.py             --name Breakeven_Slave             --collect-data backtesting             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
 
           # Create AppDir layout
           rm -rf AppDir
