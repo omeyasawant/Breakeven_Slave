@@ -64,7 +64,7 @@ from urllib3.util.retry import Retry
 
 slave_id = None
 slave_name = 'omeya_sudo'
-buffer_cores = 1
+buffer_cores = 6
 total_subtasks = 0
 completed = None
 WORK_STATUS = "idle"
@@ -76,6 +76,13 @@ APPEND_WAITERS = {}  # req_id -> (Event, holder)
 HEARTBEAT_INTERVAL = 10          # seconds
 POOL_TIMEOUT_SEC   = 5400        # 90 min – generous share-timeout
 # -----------------------------------------------------------------
+
+
+# In[ ]:
+
+
+ACTIVE_WORKS = {}  # work_id -> control dict
+ACTIVE_WORKS_LOCK = threading.Lock()
 
 
 # In[5]:
@@ -1559,6 +1566,97 @@ def api_write_text(conn, slave_id, work_id, token, dir_name, text: str, abs_path
 
 # # Slave Code
 
+# In[ ]:
+
+
+def load_buffer_cores_from_file(default: int = 6) -> int:
+    # looks next to the script (or current working dir if frozen)
+    base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    path = os.path.join(base_dir, "buffer_cores.txt")
+    try:
+        if not os.path.exists(path):
+            return default
+        raw = open(path, "r", encoding="utf-8").read().strip()
+        n = int(raw)
+        if n < 0:
+            return default
+        return n
+    except Exception as e:
+        print(f"[BUFFER_CORES][WARN] failed reading {path}: {e} -> default={default}")
+        return default
+
+
+# In[ ]:
+
+
+def _register_active_work(work_id: str, control: dict):
+    with ACTIVE_WORKS_LOCK:
+        ACTIVE_WORKS[work_id] = control
+
+def _pop_active_work(work_id: str):
+    with ACTIVE_WORKS_LOCK:
+        return ACTIVE_WORKS.pop(work_id, None)
+
+def _stop_active_work(work_id: str, reason: str = "stop_work"):
+    """
+    Best-effort immediate stop:
+      - set stop_event (cooperative)
+      - terminate multiprocessing pool if present
+      - kill tracked child pids if present
+      - mark WORK_STATUS idle and notify master
+    """
+    ctrl = None
+    with ACTIVE_WORKS_LOCK:
+        ctrl = ACTIVE_WORKS.get(work_id)
+
+    if not ctrl:
+        return False
+
+    print(f"[STOP_WORK] Received stop for work_id={work_id} reason={reason}")
+
+    # cooperative signal
+    try:
+        ev = ctrl.get("stop_event")
+        if ev:
+            ev.set()
+    except Exception:
+        pass
+
+    # terminate pool
+    try:
+        pool = ctrl.get("pool")
+        if pool:
+            pool.terminate()
+            pool.join()
+    except Exception as e:
+        print(f"[STOP_WORK][WARN] pool terminate err: {e}")
+
+    # kill child processes (best effort)
+    try:
+        pids = list(ctrl.get("child_pids") or [])
+        for pid in pids:
+            try:
+                psutil.Process(pid).kill()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # cleanup UI threads/tqdm if present
+    try:
+        for evt_name in ("heartbeat_stop_event", "progress_stop_event", "watchdog_stop_event"):
+            evx = ctrl.get(evt_name)
+            if evx:
+                evx.set()
+    except Exception:
+        pass
+
+    # release registry entry
+    _pop_active_work(work_id)
+
+    return True
+
+
 # In[28]:
 
 
@@ -1708,11 +1806,27 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
 
     final_results = None
     work_success = False
+    stopped_by_master = False
+    
     slave_start_time = int(time.time() * 1000)  # Time when starting actual work
 
     WORK_STATUS = "working"
     #send_message(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
     safe_send(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
+
+    
+    # STOP control (separate from heartbeat stop_event)
+    hard_stop_event = threading.Event()
+
+    control = {
+        "stop_event": hard_stop_event,
+        "pool": None,
+        "child_pids": [],
+        "progress_stop_event": None,
+        "watchdog_stop_event": None,
+    }
+    _register_active_work(work_id, control)
+
 
     
     try:
@@ -1744,6 +1858,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             
             # --- Start Heartbeat ---
             stop_event = threading.Event()
+            control["heartbeat_stop_event"] = stop_event
             heartbeat_thread = threading.Thread(
                                                 target=heartbeat_sender,
                                                 args=(conn, work_id, work_name, get_progress,stop_event),
@@ -1754,6 +1869,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             # --- Start Progress Bar ---
             progress_bar = tqdm(total=total_subtasks, desc=f"Slave {slave_id} Progress", position=0, leave=True)
             progress_stop_event = threading.Event()
+            control["progress_stop_event"] = progress_stop_event
             
             def progress_updater():
                 last_completed = 0
@@ -1779,6 +1895,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
 
             # --- Start Watchdog ---
             watchdog_stop_event = threading.Event()
+            control["watchdog_stop_event"] = watchdog_stop_event
             def watchdog():
                 timeout_sec = 6000  # 10 minutes
                 start_time = time.time()
@@ -1802,9 +1919,22 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             # --- Safe multiprocessing with timeout ---
             try:
                 with mp.Pool(processes=pool_size, initializer=init_child, initargs=(completed,)) as pool:
+
+                    control["pool"] = pool
+
+                    # track children (best-effort)
+                    try:
+                        control["child_pids"] = [p.pid for p in pool._pool if p is not None]
+                    except Exception:
+                        control["child_pids"] = []
+
+
+
+                    
                     #result_async = pool.starmap_async(process_wrapper,[(mini_input[0],mini_input[1],completed) for mini_input in Inputs])
                     result_async = pool.starmap_async(process_wrapper,Inputs)
-    
+
+                    '''
                     try:
                         final_results = result_async.get(timeout=POOL_TIMEOUT_SEC)  # 90 min max
                     except mp.TimeoutError:
@@ -1815,10 +1945,31 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
                     except Exception as e:
                         print(f"Error while waiting pool processing results {work_id}: {str(e)}")
                         #conn.close()
+                    '''
+
+                    # cancellable wait loop (checks stop_work frequently)
+                    t0 = time.time()
+                    while True:
+                        if hard_stop_event.is_set():
+                            raise RuntimeError("stopped_by_master")
+
+                        try:
+                            final_results = result_async.get(timeout=1.0)
+                            break
+                        except mp.TimeoutError:
+                            if time.time() - t0 > POOL_TIMEOUT_SEC:
+                                raise TimeoutError("Pool processing timeout")
+                            continue
             
             except Exception as e:
-                        print(f"Error while pool processing {work_id}: {str(e)}")
-                        #conn.close()
+                #print(f"Error while pool processing {work_id}: {str(e)}")
+                #conn.close()
+                print(f"[WORK][ERROR] {work_id} pool failed: {type(e).__name__}: {e}")
+                traceback.print_exc()
+                raise
+                
+            finally:
+                control["pool"] = None
 
 
             if len(final_results) == len(Inputs):
@@ -1849,6 +2000,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             completed = mp.Value('i', 0)
         
             stop_event = threading.Event()
+            control["heartbeat_stop_event"] = stop_event
             heartbeat_thread = threading.Thread(
                 target=heartbeat_sender,
                 args=(conn, work_id, work_name, get_progress, stop_event),
@@ -1859,6 +2011,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             # --- Start Progress Bar ---
             progress_bar = tqdm(total=total_subtasks, desc=f"Slave {slave_id} Progress", position=0, leave=True)
             progress_stop_event = threading.Event()
+            control["progress_stop_event"] = progress_stop_event
             
             def progress_updater():
                 last_completed = 0
@@ -1884,6 +2037,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
 
             # --- Start Watchdog ---
             watchdog_stop_event = threading.Event()
+            control["watchdog_stop_event"] = watchdog_stop_event
             def watchdog():
                 timeout_sec = 6000  # 10 minutes
                 start_time = time.time()
@@ -1956,8 +2110,39 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             work_success = False
 
     except Exception as e:
-        final_results = f"Error while processing {work_id}: {str(e)}"
-        #conn.close()
+        if "stopped_by_master" in str(e):
+            stopped_by_master = True
+            print(f"[WORK] {work_id} stopped_by_master; skipping final_result send.")
+        else:
+            final_results = f"Error while processing {work_id}: {str(e)}"
+            traceback.print_exc()
+
+    if stopped_by_master:
+        # best-effort local cleanup (in case stop_work arrived while we were mid-setup)
+        try:
+            stop_event.set()
+        except Exception:
+            pass
+        try:
+            progress_stop_event.set()
+        except Exception:
+            pass
+        try:
+            watchdog_stop_event.set()
+        except Exception:
+            pass
+        try:
+            progress_bar.close()
+        except Exception:
+            pass
+        # ensure registry entry is cleared even if stop_work wasn't received (rare)
+        try:
+            _pop_active_work(work_id)
+        except Exception:
+            pass
+        WORK_STATUS = "idle"
+        safe_send(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
+        return
 
 
 
@@ -2074,7 +2259,9 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     global slave_id
     global buffer_cores
     global slave_name
-
+    global WORK_STATUS
+    
+    buffer_cores = load_buffer_cores_from_file(default=6)
 
     # Get CPU frequency (in MHz)
     cpu_freq = psutil.cpu_freq()
@@ -2318,6 +2505,8 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     slave_id = msg["slave_id"]
                     print(f"[SLAVE] Assigned ID: {slave_id}")
                     
+                    buffer_cores = load_buffer_cores_from_file(default=6)
+                    
                     sys_info = {
                                 "slave_id": slave_id,
                                 "info": {
@@ -2340,6 +2529,9 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     safe_send(client, sys_info)
     
                 elif msg.get("command") == "request_sys_info":
+
+                    buffer_cores = load_buffer_cores_from_file(default=6)
+                    
                     sys_info = {
                                 "slave_id": slave_id,
                                 "info": {
@@ -2438,6 +2630,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                         ev.set()
                     continue
 
+                
                 elif msg.get("command") == "api_append_rows_resp":
                     rid = msg.get("req_id")
                     waiter = APPEND_WAITERS.get(rid)
@@ -2446,7 +2639,26 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                         holder["resp"] = msg
                         ev.set()
                     continue
+
                 
+                elif msg.get("command") == "stop_work":
+                    wid = msg.get("work_id")
+                    reason = msg.get("reason", "stop_work")
+                    if wid:
+                        _stop_active_work(wid, reason=reason)
+
+                        # mark idle + notify master immediately
+                        WORK_STATUS = "idle"
+                        safe_send(client, {"slave_id": slave_id, "work_status": WORK_STATUS})
+                        safe_send(client, {
+                            "slave_id": slave_id,
+                            "command": "stop_work_ack",
+                            "work_id": wid,
+                            "status": "stopped",
+                            "reason": reason,
+                        })
+                    continue
+
 
                     
                 elif msg.get("stream_type") == "final_result_ack":
