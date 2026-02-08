@@ -1797,6 +1797,16 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
     global WORK_STATUS
     global FINAL_RESULT_ACK_EVENTS
 
+    # Always define these so cleanup paths never crash
+    stop_event = None
+    progress_stop_event = None
+    watchdog_stop_event = None
+    heartbeat_thread = None
+    progress_thread = None
+    watchdog_thread = None
+    progress_bar = None
+
+
     slave_receive_time = int(time.time() * 1000)  # Time when slave received work
     print(f"[WORK] Starting {work_id}: {work_name} ({work_type})")
 
@@ -2118,28 +2128,27 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             traceback.print_exc()
 
     if stopped_by_master:
-        # best-effort local cleanup (in case stop_work arrived while we were mid-setup)
         try:
-            stop_event.set()
+            if stop_event: stop_event.set()
         except Exception:
             pass
         try:
-            progress_stop_event.set()
+            if progress_stop_event: progress_stop_event.set()
         except Exception:
             pass
         try:
-            watchdog_stop_event.set()
+            if watchdog_stop_event: watchdog_stop_event.set()
         except Exception:
             pass
         try:
-            progress_bar.close()
+            if progress_bar: progress_bar.close()
         except Exception:
             pass
-        # ensure registry entry is cleared even if stop_work wasn't received (rare)
         try:
             _pop_active_work(work_id)
         except Exception:
             pass
+
         WORK_STATUS = "idle"
         safe_send(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
         return
