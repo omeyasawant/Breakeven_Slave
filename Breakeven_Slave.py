@@ -2049,7 +2049,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             watchdog_stop_event = threading.Event()
             control["watchdog_stop_event"] = watchdog_stop_event
             def watchdog():
-                timeout_sec = 6000  # 10 minutes
+                timeout_sec = 18000  # 10 minutes
                 start_time = time.time()
                 try:
                     while not watchdog_stop_event.is_set():
