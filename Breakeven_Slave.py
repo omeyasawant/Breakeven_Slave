@@ -223,7 +223,7 @@ def fetch_payload_ref(payload_ref: dict) -> dict:
 # In[8]:
 
 
-def api_append_rows_gz(conn, slave_id, work_id, token, dir_name, abs_path, header, rows, allowed_output_prefix, timeout=600):
+def api_append_rows_gz(conn, slave_id, work_id, token, dir_name, abs_path, header, rows, allowed_output_prefix, timeout=1800):
     req_id = uuid.uuid4().hex
     rel = to_rel_path_under_run(abs_path, dir_name)
     rel_path = f"{allowed_output_prefix.rstrip('/')}/{rel}"
@@ -1476,7 +1476,7 @@ PRESIGN_WAITERS = {}  # req_id -> (Event, holder)
 UPLOAD_MAX_CONCURRENCY = 50
 _UPLOAD_SEM = threading.Semaphore(UPLOAD_MAX_CONCURRENCY)
 
-def request_presigned_put(conn, slave_id, work_id, token, rel_path, content_type, size=None, sha256=None, timeout=600):
+def request_presigned_put(conn, slave_id, work_id, token, rel_path, content_type, size=None, sha256=None, timeout=1800):
     req_id = uuid.uuid4().hex
     req = {
         "command": "api_presign_put",
@@ -2049,7 +2049,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             watchdog_stop_event = threading.Event()
             control["watchdog_stop_event"] = watchdog_stop_event
             def watchdog():
-                timeout_sec = 18000  # 10 minutes
+                timeout_sec = 18000  # 10 minutes =600 sec, 18000 sec= 5 hours
                 start_time = time.time()
                 try:
                     while not watchdog_stop_event.is_set():
