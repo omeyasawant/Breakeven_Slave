@@ -63,8 +63,8 @@ from urllib3.util.retry import Retry
 
 
 slave_id = None
-slave_name = 'omeya_sudo'
-buffer_cores = 6
+slave_name = 'De4ault'
+buffer_cores = 4
 total_subtasks = 0
 completed = None
 WORK_STATUS = "idle"
@@ -2097,6 +2097,11 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
                 except Exception as e:
                     print(f"[BT][ERROR] work_id={work_id} tm={getattr(tm_params,'get',lambda k, d=None: d)('name',None)} err={e}")
                     traceback.print_exc()
+
+                    if "token_expired" in str(e):
+                        # stop work immediately so you don't waste hours
+                        raise RuntimeError("token_expired_fatal")
+                    
                     return False
                 finally:
                     with completed.get_lock():
@@ -2275,6 +2280,8 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     # Get CPU frequency (in MHz)
     cpu_freq = psutil.cpu_freq()
     cpu_speed = round(cpu_freq.max, 2) if cpu_freq else None  # max speed in MHz
+    cpu_speed_max = round(cpu_freq.max, 2) if cpu_freq else None
+    cpu_speed_cur = round(cpu_freq.current, 2) if cpu_freq else None
 
     # Prepare handshake payload before hand
     handshake = {
@@ -2289,6 +2296,22 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
             output = subprocess.check_output(['wmic', 'memorychip', 'get', 'Speed'], universal_newlines=True)
             speeds = [int(s) for s in output.strip().split() if s.isdigit()]
             mem_speed = max(speeds) if speeds else None
+        else:
+            # Linux: try dmidecode (needs sudo) OR fallback to /sys
+            # dmidecode is most accurate but may require privileges
+            try:
+                out = subprocess.check_output(["dmidecode", "-t", "memory"], stderr=subprocess.DEVNULL, universal_newlines=True)
+                speeds = []
+                for line in out.splitlines():
+                    line = line.strip()
+                    if line.startswith("Speed:") and "Unknown" not in line:
+                        # e.g. "Speed: 3200 MT/s"
+                        nums = [int(x) for x in line.split() if x.isdigit()]
+                        if nums:
+                            speeds.append(nums[0])
+                mem_speed = max(speeds) if speeds else None
+            except Exception:
+                mem_speed = None
     except Exception as e:
         mem_speed = None
 
@@ -2527,7 +2550,8 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                                     "platform": platform.system(),
                                     "cpu_count": psutil.cpu_count(logical=True),
                                     "cpu_available_estimate": max(1, round((100 - psutil.cpu_percent(interval=1)) / 100 * psutil.cpu_count(logical=True))),
-                                    "cpu_speed_mhz": cpu_speed,
+                                    "cpu_speed_mhz": cpu_speed_cur,
+                                    "cpu_speed_mhz_max": cpu_speed_max,
                                     "memory_available_gb": round(psutil.virtual_memory().available / (1024**3), 2),
                                     "memory_speed_mhz": mem_speed,
                                     "buffer_cores": buffer_cores
@@ -2552,7 +2576,8 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                                     "platform": platform.system(),
                                     "cpu_count": psutil.cpu_count(logical=True),
                                     "cpu_available_estimate": max(1, round((100 - psutil.cpu_percent(interval=1)) / 100 * psutil.cpu_count(logical=True))),
-                                    "cpu_speed_mhz": cpu_speed,
+                                    "cpu_speed_mhz": cpu_speed_cur,
+                                    "cpu_speed_mhz_max": cpu_speed_max,
                                     "memory_available_gb": round(psutil.virtual_memory().available / (1024**3), 2),
                                     "memory_speed_mhz": mem_speed,
                                     "buffer_cores": buffer_cores
