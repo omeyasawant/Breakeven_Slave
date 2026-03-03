@@ -64,7 +64,10 @@ from urllib3.util.retry import Retry
 
 slave_id = None
 slave_name = 'De4ault'
+version = "0.0.0.0"
 buffer_cores = 4
+cores_used = 0
+CORES_USED_LOCK = threading.Lock()
 total_subtasks = 0
 completed = None
 WORK_STATUS = "idle"
@@ -106,6 +109,56 @@ adapter = HTTPAdapter(
 
 _HTTP.mount("http://", adapter)
 _HTTP.mount("https://", adapter)
+
+
+# In[ ]:
+
+
+def load_client_config():
+    """
+    Load slave_name and version from ../client_config.json
+    relative to the current script directory.
+    """
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.abspath(os.path.join(base_dir, "../client_config.json"))
+
+        if not os.path.exists(config_path):
+            print(f"[CONFIG] client_config.json not found at {config_path}")
+            return None
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        slave_name = config.get("name", "Unknown")
+        version = config.get("version", "Unknown")
+
+        print(f"[CONFIG] Loaded client_config.json from {config_path}")
+        print(f"[SLAVE][CONFIG] Slave Name : {slave_name}")
+        print(f"[SLAVE][CONFIG] Version    : {version}")
+
+        return config
+
+    except Exception as e:
+        print(f"[CONFIG][ERROR] Failed loading client_config.json: {e}")
+        return None
+
+
+# In[ ]:
+
+
+def set_cores_used(n: int, why: str = ""):
+    global cores_used
+    try:
+        n = int(n)
+    except Exception:
+        n = 0
+    if n < 0:
+        n = 0
+    with CORES_USED_LOCK:
+        cores_used = n
+    if why:
+        print(f"[CORES_USED] {cores_used} ({why})")
 
 
 # ## Connection DEBUGS
@@ -224,6 +277,10 @@ def fetch_payload_ref(payload_ref: dict) -> dict:
 
 
 def api_append_rows_gz(conn, slave_id, work_id, token, dir_name, abs_path, header, rows, allowed_output_prefix, timeout=1800):
+
+    if not allowed_output_prefix:
+        raise ValueError("allowed_output_prefix is missing (None) — cannot write results")
+    
     req_id = uuid.uuid4().hex
     rel = to_rel_path_under_run(abs_path, dir_name)
     rel_path = f"{allowed_output_prefix.rstrip('/')}/{rel}"
@@ -337,6 +394,21 @@ print("")
 
 # ## Messaging Protocols
 # 
+
+# In[ ]:
+
+
+def _ts():
+    # local time with seconds (easy to scan in logs)
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def log_conn(event: str, **kvs):
+    extra = " ".join([f"{k}={v}" for k, v in kvs.items()])
+    if extra:
+        print(f"[CONN] {_ts()} {event} {extra}")
+    else:
+        print(f"[CONN] {_ts()} {event}")
+
 
 # In[10]:
 
@@ -1532,6 +1604,10 @@ def to_rel_path_under_run(abs_path: str, dir_name: str) -> str:
 
 def api_write_df_csv_gz(conn, slave_id, work_id, token, dir_name, df: pd.DataFrame, abs_path: str,
                         index=False, allowed_output_prefix= None):
+    
+    if not allowed_output_prefix:
+        raise ValueError("allowed_output_prefix is missing (None) — cannot write results")
+
     # create gzip bytes exactly like df.to_csv(..., compression="gzip") would
     buf = io.StringIO()
     df.to_csv(buf, index=index)
@@ -1654,6 +1730,8 @@ def _stop_active_work(work_id: str, reason: str = "stop_work"):
     # release registry entry
     _pop_active_work(work_id)
 
+    set_cores_used(0, why=f"stop_work work_id={work_id}")
+    
     return True
 
 
@@ -1856,10 +1934,10 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             cpu_usage = psutil.cpu_percent(interval=1)
             available_cores = int((100 - cpu_usage) / 100 * total_cores)
             pool_size = max(1, min(available_cores - buffer_cores, work_shares))
-
+            
             print(f"[WORK] Using {pool_size} workers (available: {available_cores}, total: {total_cores})")
 
-
+            set_cores_used(pool_size, why=f"FE_Imprinting start work_id={work_id}")
 
 
             # --- Progress tracking ---
@@ -2071,6 +2149,8 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             available_cores = int((100 - cpu_usage) / 100 * total_cores)
             pool_size = max(1, min(available_cores - buffer_cores, total_subtasks))
 
+            set_cores_used(pool_size, why=f"Backtesting start work_id={work_id}")
+            
             '''
             def bt_wrapper(flag, tm_params, verbose):
                 # CALL YOUR EXISTING perform_backtesting LOGIC,
@@ -2132,6 +2212,13 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             final_results = f"Error while processing {work_id}: {str(e)}"
             traceback.print_exc()
 
+    # Always reset cores_used when work ends (success, error, or stop_work)
+    status = "success" if work_success else "failure"
+    if stopped_by_master:
+        status = "stopped_by_master"
+    set_cores_used(0, why=f"{work_type} end ({status}) work_id={work_id}")
+    
+    
     if stopped_by_master:
         try:
             if stop_event: stop_event.set()
@@ -2268,7 +2355,9 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
     ''' 
     print(f"[WORK] Completed work {work_id}: {work_name} ({work_type})")
 
+    
 
+    
 def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     global slave_id
     global buffer_cores
@@ -2454,6 +2543,10 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     print(f"[SLAVE] Assigned ID: {slave_id} (connected via {ip_used})")
                     #print(f"[SLAVE] CONNECTED in {total_ms} ms (DNS+TCP+TLS+assign_id)")
                     print(f"[SLAVE] CONNECTED in {total_sec:.3f}s ({total_ms} ms) (DNS+TCP+TLS+assign_id)")
+
+                    conn_established_unix = time.time()
+                    last_rx_unix = time.time()
+                    log_conn("CONNECTED", slave_id=slave_id, via_ip=ip_used, port=port_used)
                     
                     connected = True
                     # Steady-state: never timeout reads, just wait for messages
@@ -2545,6 +2638,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                                     "uid": get_machine_uid(),
                                     "work_status": WORK_STATUS,
                                     "slave_name": slave_name,
+                                    "version": version,
                                     "host_name":socket.gethostname(),
                                     "ip": get_ip_address(),
                                     "platform": platform.system(),
@@ -2554,6 +2648,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                                     "cpu_speed_mhz_max": cpu_speed_max,
                                     "memory_available_gb": round(psutil.virtual_memory().available / (1024**3), 2),
                                     "memory_speed_mhz": mem_speed,
+                                    "cores_used": cores_used,
                                     "buffer_cores": buffer_cores
                                 }
                             }
@@ -2571,6 +2666,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                                     "uid": get_machine_uid(),
                                     "work_status": WORK_STATUS,
                                     "slave_name": slave_name,
+                                    "version": version,
                                     "host_name":socket.gethostname(),
                                     "ip": get_ip_address(),
                                     "platform": platform.system(),
@@ -2580,6 +2676,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                                     "cpu_speed_mhz_max": cpu_speed_max,
                                     "memory_available_gb": round(psutil.virtual_memory().available / (1024**3), 2),
                                     "memory_speed_mhz": mem_speed,
+                                    "cores_used": cores_used,
                                     "buffer_cores": buffer_cores
                                 }
                             }
@@ -2709,6 +2806,19 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                 continue
                 
             except Exception as e:
+
+                now = time.time()
+                conn_age = now - conn_established_unix if conn_established_unix else None
+                idle_age = now - last_rx_unix if last_rx_unix else None
+
+                log_conn(
+                    "DISCONNECTED",
+                    err=type(e).__name__,
+                    msg=str(e),
+                    conn_age_sec=round(conn_age, 2) if conn_age is not None else None,
+                    idle_sec=round(idle_age, 2) if idle_age is not None else None
+                )
+                
                 print(f"[SLAVE] Connection lost or error occurred: {e}")
                 traceback.print_exc()
                 break
@@ -2716,6 +2826,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     finally:
         #client.close()
         print(f"[DISCONNECTED]")
+        log_conn("DISCONNECTED_FINAL")
 
 
 # In[ ]:
@@ -2723,6 +2834,12 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
 
 if __name__ == "__main__":
     mp.freeze_support()
+
+    _client_config = load_client_config()
+
+    if _client_config:
+        slave_name = _client_config.get("name", slave_name)
+        version = _client_config.get("version", version)
 
     try:
         ready_path = os.path.join(os.getcwd(), "slave_ready.txt")
