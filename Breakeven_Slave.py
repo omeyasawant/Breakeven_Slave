@@ -118,6 +118,11 @@ def load_client_config():
     """
     Load slave_name and version from ../client_config.json
     relative to the current script directory.
+
+    Supports:
+    - UTF-8
+    - UTF-8 with BOM
+    - UTF-16
     """
     try:
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -127,13 +132,26 @@ def load_client_config():
             print(f"[CONFIG] client_config.json not found at {config_path}")
             return None
 
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
+        config = None
+        used_encoding = None
+        last_error = None
+
+        for enc in ("utf-8-sig", "utf-8", "utf-16"):
+            try:
+                with open(config_path, "r", encoding=enc) as f:
+                    config = json.load(f)
+                used_encoding = enc
+                break
+            except Exception as e:
+                last_error = e
+
+        if config is None:
+            raise last_error if last_error else RuntimeError("Unknown config read failure")
 
         slave_name = config.get("name", "Unknown")
         version = config.get("version", "Unknown")
 
-        print(f"[CONFIG] Loaded client_config.json from {config_path}")
+        print(f"[CONFIG] Loaded client_config.json from {config_path} using encoding={used_encoding}")
         print(f"[SLAVE][CONFIG] Slave Name : {slave_name}")
         print(f"[SLAVE][CONFIG] Version    : {version}")
 
@@ -1646,19 +1664,61 @@ def api_write_text(conn, slave_id, work_id, token, dir_name, text: str, abs_path
 
 
 def load_buffer_cores_from_file(default: int = 6) -> int:
-    # looks next to the script (or current working dir if frozen)
-    base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-    path = os.path.join(base_dir, "buffer_cores.txt")
+    """
+    Load buffer_cores from ../client_config.json.
+
+    Supports:
+    - UTF-8
+    - UTF-8 with BOM
+    - UTF-16
+
+    Falls back to default if file/key/value is invalid.
+    """
     try:
-        if not os.path.exists(path):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.abspath(os.path.join(base_dir, "../client_config.json"))
+
+        if not os.path.exists(config_path):
+            print(f"[BUFFER_CORES][WARN] client_config.json not found at {config_path} -> default={default}")
             return default
-        raw = open(path, "r", encoding="utf-8").read().strip()
-        n = int(raw)
+
+        config = None
+        used_encoding = None
+        last_error = None
+
+        for enc in ("utf-8-sig", "utf-8", "utf-16"):
+            try:
+                with open(config_path, "r", encoding=enc) as f:
+                    config = json.load(f)
+                used_encoding = enc
+                break
+            except Exception as e:
+                last_error = e
+
+        if config is None:
+            raise last_error if last_error else RuntimeError("Unknown config read failure")
+
+        raw_val = config.get("buffer_cores", None)
+
+        if raw_val is None:
+            print(f"[BUFFER_CORES][WARN] 'buffer_cores' not found in client_config.json (encoding={used_encoding}) -> default={default}")
+            return default
+
+        try:
+            n = int(raw_val)
+        except Exception:
+            print(f"[BUFFER_CORES][WARN] invalid buffer_cores value '{raw_val}' -> default={default}")
+            return default
+
         if n < 0:
+            print(f"[BUFFER_CORES][WARN] buffer_cores cannot be negative ({n}) -> default={default}")
             return default
+
+        print(f"[BUFFER_CORES] Loaded from client_config.json: {n} (encoding={used_encoding})")
         return n
+
     except Exception as e:
-        print(f"[BUFFER_CORES][WARN] failed reading {path}: {e} -> default={default}")
+        print(f"[BUFFER_CORES][WARN] failed reading client_config.json: {e} -> default={default}")
         return default
 
 
