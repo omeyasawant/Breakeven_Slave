@@ -67,6 +67,15 @@ slave_name = 'De4ault'
 version = "0.0.0.0"
 buffer_cores = 4
 cores_used = 0
+
+DEFAULT_PAYOUT_WALLET = "NO_WALLET_CONFIGURED"
+_CLIENT_CONFIG_CACHE = {
+    "path": None,
+    "mtime": None,
+    "data": None,
+    "encoding": None,
+}
+
 CORES_USED_LOCK = threading.Lock()
 total_subtasks = 0
 completed = None
@@ -88,7 +97,7 @@ ACTIVE_WORKS = {}  # work_id -> control dict
 ACTIVE_WORKS_LOCK = threading.Lock()
 
 
-# In[5]:
+# In[2]:
 
 
 # Global session for ALL HTTP calls to MinIO (PUT/GET)
@@ -114,6 +123,7 @@ _HTTP.mount("https://", adapter)
 # In[ ]:
 
 
+'''
 def load_client_config():
     """
     Load slave_name and version from ../client_config.json
@@ -160,6 +170,85 @@ def load_client_config():
     except Exception as e:
         print(f"[CONFIG][ERROR] Failed loading client_config.json: {e}")
         return None
+'''
+
+
+# In[ ]:
+
+
+def load_client_config(force_reload: bool = False, verbose: bool = True):
+    """
+    Load full client config from ../client_config.json.
+
+    Supports:
+    - UTF-8
+    - UTF-8 with BOM
+    - UTF-16
+
+    Uses mtime-based cache to avoid repeated disk reads / repeated prints.
+    """
+    global _CLIENT_CONFIG_CACHE
+    global DEFAULT_PAYOUT_WALLET
+
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.abspath(os.path.join(base_dir, "../client_config.json"))
+
+        if not os.path.exists(config_path):
+            if verbose:
+                print(f"[CONFIG] client_config.json not found at {config_path}")
+            return None
+
+        mtime = os.path.getmtime(config_path)
+
+        if (
+            not force_reload
+            and _CLIENT_CONFIG_CACHE["path"] == config_path
+            and _CLIENT_CONFIG_CACHE["mtime"] == mtime
+            and _CLIENT_CONFIG_CACHE["data"] is not None
+        ):
+            cfg = _CLIENT_CONFIG_CACHE["data"]
+            DEFAULT_PAYOUT_WALLET = str(cfg.get("default_payout_wallet") or "NO_WALLET_CONFIGURED").strip() or "NO_WALLET_CONFIGURED"
+            return cfg
+
+        config = None
+        used_encoding = None
+        last_error = None
+
+        for enc in ("utf-8-sig", "utf-8", "utf-16"):
+            try:
+                with open(config_path, "r", encoding=enc) as f:
+                    config = json.load(f)
+                used_encoding = enc
+                break
+            except Exception as e:
+                last_error = e
+
+        if config is None:
+            raise last_error if last_error else RuntimeError("Unknown config read failure")
+
+        _CLIENT_CONFIG_CACHE = {
+            "path": config_path,
+            "mtime": mtime,
+            "data": config,
+            "encoding": used_encoding,
+        }
+
+        DEFAULT_PAYOUT_WALLET = str(config.get("default_payout_wallet") or "NO_WALLET_CONFIGURED").strip() or "NO_WALLET_CONFIGURED"
+
+        if verbose:
+            print(f"[CONFIG] Loaded client_config.json from {config_path} using encoding={used_encoding}")
+            print(f"[SLAVE][CONFIG] Slave Name : {config.get('name', 'Unknown')}")
+            print(f"[SLAVE][CONFIG] Version    : {config.get('version', 'Unknown')}")
+            print(f"[SLAVE][CONFIG] Payout Wallet : {DEFAULT_PAYOUT_WALLET}")
+
+        return config
+
+    except Exception as e:
+        if verbose:
+            print(f"[CONFIG][ERROR] Failed loading client_config.json: {e}")
+        DEFAULT_PAYOUT_WALLET = "NO_WALLET_CONFIGURED"
+        return None
 
 
 # In[ ]:
@@ -177,6 +266,17 @@ def set_cores_used(n: int, why: str = ""):
         cores_used = n
     if why:
         print(f"[CORES_USED] {cores_used} ({why})")
+
+
+# In[ ]:
+
+
+def get_default_payout_wallet(refresh: bool = True) -> str:
+    global DEFAULT_PAYOUT_WALLET
+    if refresh:
+        load_client_config(force_reload=False, verbose=False)
+    wallet = str(DEFAULT_PAYOUT_WALLET or "").strip()
+    return wallet if wallet else "NO_WALLET_CONFIGURED"
 
 
 # ## Connection DEBUGS
@@ -1663,6 +1763,7 @@ def api_write_text(conn, slave_id, work_id, token, dir_name, text: str, abs_path
 # In[ ]:
 
 
+'''
 def load_buffer_cores_from_file(default: int = 6) -> int:
     """
     Load buffer_cores from ../client_config.json.
@@ -1719,6 +1820,53 @@ def load_buffer_cores_from_file(default: int = 6) -> int:
 
     except Exception as e:
         print(f"[BUFFER_CORES][WARN] failed reading client_config.json: {e} -> default={default}")
+        return default
+'''
+
+
+# In[ ]:
+
+
+def load_buffer_cores_from_file(default: int = 6, verbose: bool = False) -> int:
+    """
+    Load buffer_cores from cached client_config.json.
+    Only prints when verbose=True.
+    """
+    try:
+        config = load_client_config(force_reload=False, verbose=False)
+        used_encoding = _CLIENT_CONFIG_CACHE.get("encoding")
+
+        if config is None:
+            if verbose:
+                print(f"[BUFFER_CORES][WARN] client_config unavailable -> default={default}")
+            return default
+
+        raw_val = config.get("buffer_cores", None)
+
+        if raw_val is None:
+            if verbose:
+                print(f"[BUFFER_CORES][WARN] 'buffer_cores' not found in client_config.json (encoding={used_encoding}) -> default={default}")
+            return default
+
+        try:
+            n = int(raw_val)
+        except Exception:
+            if verbose:
+                print(f"[BUFFER_CORES][WARN] invalid buffer_cores value '{raw_val}' -> default={default}")
+            return default
+
+        if n < 0:
+            if verbose:
+                print(f"[BUFFER_CORES][WARN] buffer_cores cannot be negative ({n}) -> default={default}")
+            return default
+
+        if verbose:
+            print(f"[BUFFER_CORES] Loaded from client_config.json: {n} (encoding={used_encoding})")
+        return n
+
+    except Exception as e:
+        if verbose:
+            print(f"[BUFFER_CORES][WARN] failed reading client_config.json: {e} -> default={default}")
         return default
 
 
@@ -2313,7 +2461,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
         result_payload = serialize_dataframes(final_results)
 
 
-
+    default_payout_wallet = get_default_payout_wallet(refresh=True)
     
     slave_end_time = int(time.time() * 1000)  # Finished actual work
 
@@ -2328,12 +2476,11 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
                     "stream_type": "final_result",
                     "work_success": work_success,
                     "result": result_payload, 
-
-                    # Timing Info
                     "slave_receive_time": slave_receive_time,
                     "slave_start_time": slave_start_time,
                     "slave_end_time": slave_end_time,
-                    "slave_send_time": slave_send_time
+                    "slave_send_time": slave_send_time,
+                    "default_payout_wallet": default_payout_wallet
                 }
 
     ack_event = threading.Event()
@@ -2424,7 +2571,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     global slave_name
     global WORK_STATUS
     
-    buffer_cores = load_buffer_cores_from_file(default=6)
+    buffer_cores = load_buffer_cores_from_file(default=6, verbose=True)
 
     # Get CPU frequency (in MHz)
     cpu_freq = psutil.cpu_freq()
@@ -2690,7 +2837,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     slave_id = msg["slave_id"]
                     print(f"[SLAVE] Assigned ID: {slave_id}")
                     
-                    buffer_cores = load_buffer_cores_from_file(default=6)
+                    buffer_cores = load_buffer_cores_from_file(default=6, verbose=False)
                     
                     sys_info = {
                                 "slave_id": slave_id,
@@ -2718,7 +2865,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     
                 elif msg.get("command") == "request_sys_info":
 
-                    buffer_cores = load_buffer_cores_from_file(default=6)
+                    buffer_cores = load_buffer_cores_from_file(default=6, verbose=False)
                     
                     sys_info = {
                                 "slave_id": slave_id,
@@ -2895,7 +3042,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
 if __name__ == "__main__":
     mp.freeze_support()
 
-    _client_config = load_client_config()
+    _client_config = load_client_config(force_reload=True, verbose=True)
 
     if _client_config:
         slave_name = _client_config.get("name", slave_name)
