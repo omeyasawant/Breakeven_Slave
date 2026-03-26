@@ -176,6 +176,54 @@ def load_client_config():
 # In[ ]:
 
 
+def get_runtime_base_dir() -> str:
+    """
+    Return the real runtime base directory.
+
+    - In normal .py runs: folder containing this script
+    - In frozen exe runs: folder containing the executable
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_client_config_path() -> str:
+    """
+    Find client_config.json in the most likely runtime locations.
+
+    Priority:
+    1. same folder as exe/script
+    2. parent of exe/script folder
+    3. current working directory
+    4. parent of current working directory
+    """
+    base_dir = get_runtime_base_dir()
+    cwd = os.getcwd()
+
+    candidates = [
+        os.path.abspath(os.path.join(base_dir, "client_config.json")),
+        os.path.abspath(os.path.join(base_dir, "../client_config.json")),
+        os.path.abspath(os.path.join(cwd, "client_config.json")),
+        os.path.abspath(os.path.join(cwd, "../client_config.json")),
+    ]
+
+    seen = set()
+    for path in candidates:
+        norm = os.path.normcase(os.path.normpath(path))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.exists(path):
+            return path
+
+    # fallback for logging/debug visibility
+    return os.path.abspath(os.path.join(base_dir, "client_config.json"))
+
+
+# In[5]:
+
+
 def load_client_config(force_reload: bool = False, verbose: bool = True):
     """
     Load full client config from ../client_config.json.
@@ -191,9 +239,10 @@ def load_client_config(force_reload: bool = False, verbose: bool = True):
     global DEFAULT_PAYOUT_WALLET
 
     try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.abspath(os.path.join(base_dir, "../client_config.json"))
-
+        #base_dir = os.path.dirname(os.path.abspath(__file__))
+        #config_path = os.path.abspath(os.path.join(base_dir, "../client_config.json"))
+        config_path = get_client_config_path()
+        
         if not os.path.exists(config_path):
             if verbose:
                 print(f"[CONFIG] client_config.json not found at {config_path}")
