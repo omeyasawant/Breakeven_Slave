@@ -18,3 +18,4 @@ backtesting
 bokeh
 tqdm
 pyarrow
+certifi
