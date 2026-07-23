@@ -35,11 +35,6 @@ import functools
 from typing import Optional, Tuple, List
 import zstandard as zstd
 
-try:
-    import certifi
-except Exception:
-    certifi = None
-
 
 # In[2]:
 
@@ -88,9 +83,6 @@ WORK_STATUS = "idle"
 FINAL_RESULT_ACK_EVENTS = {}  # work_id -> threading.Event
 APPEND_WAITERS = {}  # req_id -> (Event, holder)
 
-_TLS_CA_BUNDLE_PATH = None
-_TLS_CA_BUNDLE_LOGGED = False
-
 
 # --- TIMEOUT CONFIG (slave side) ---------------------------------
 HEARTBEAT_INTERVAL = 10          # seconds
@@ -105,96 +97,11 @@ ACTIVE_WORKS = {}  # work_id -> control dict
 ACTIVE_WORKS_LOCK = threading.Lock()
 
 
-def resolve_ca_bundle_path() -> Optional[str]:
-    candidates = []
-
-    for env_var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
-        env_path = str(os.environ.get(env_var) or "").strip()
-        if env_path:
-            candidates.append(env_path)
-
-    if certifi is not None:
-        try:
-            candidates.append(certifi.where())
-        except Exception:
-            pass
-
-    if getattr(sys, "frozen", False):
-        runtime_root = getattr(sys, "_MEIPASS", None)
-        if runtime_root:
-            candidates.extend([
-                os.path.join(runtime_root, "certifi", "cacert.pem"),
-                os.path.join(runtime_root, "cacert.pem"),
-            ])
-
-        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        candidates.extend([
-            os.path.join(exe_dir, "certifi", "cacert.pem"),
-            os.path.join(exe_dir, "cacert.pem"),
-        ])
-
-    candidates.extend([
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-        "/etc/ssl/ca-bundle.pem",
-        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
-    ])
-
-    seen = set()
-    for candidate_path in candidates:
-        if not candidate_path:
-            continue
-        normalized = os.path.normcase(os.path.normpath(candidate_path))
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        if os.path.isfile(candidate_path):
-            return candidate_path
-
-    return None
-
-
-def get_tls_ca_bundle_path() -> Optional[str]:
-    global _TLS_CA_BUNDLE_PATH
-
-    if _TLS_CA_BUNDLE_PATH is None:
-        _TLS_CA_BUNDLE_PATH = resolve_ca_bundle_path()
-        if _TLS_CA_BUNDLE_PATH:
-            os.environ.setdefault("SSL_CERT_FILE", _TLS_CA_BUNDLE_PATH)
-            os.environ.setdefault("REQUESTS_CA_BUNDLE", _TLS_CA_BUNDLE_PATH)
-
-    return _TLS_CA_BUNDLE_PATH
-
-
-def create_verified_tls_context() -> ssl.SSLContext:
-    global _TLS_CA_BUNDLE_LOGGED
-
-    tls_context = ssl.create_default_context()
-    tls_context.check_hostname = True
-    tls_context.verify_mode = ssl.CERT_REQUIRED
-
-    ca_bundle_path = get_tls_ca_bundle_path()
-    if ca_bundle_path:
-        tls_context.load_verify_locations(cafile=ca_bundle_path)
-        if not _TLS_CA_BUNDLE_LOGGED:
-            print(f"[TLS] CA bundle: {ca_bundle_path}")
-            _TLS_CA_BUNDLE_LOGGED = True
-    elif not _TLS_CA_BUNDLE_LOGGED:
-        print("[TLS][WARN] No explicit CA bundle found; using platform trust store only")
-        _TLS_CA_BUNDLE_LOGGED = True
-
-    return tls_context
-
-
 # In[2]:
 
 
 # Global session for ALL HTTP calls to MinIO (PUT/GET)
 _HTTP = requests.Session()
-
-_HTTP_VERIFY_BUNDLE = get_tls_ca_bundle_path()
-if _HTTP_VERIFY_BUNDLE:
-    _HTTP.verify = _HTTP_VERIFY_BUNDLE
 
 retries = Retry(
     total=5,
@@ -317,7 +224,7 @@ def get_client_config_path() -> str:
 # In[5]:
 
 
-def load_client_config(force_reload: bool = False, verbose: bool = True):
+def load_client_config(force_reload: bool = True, verbose: bool = True):
     """
     Load full client config from ../client_config.json.
 
@@ -416,7 +323,7 @@ def set_cores_used(n: int, why: str = ""):
 def get_default_payout_wallet(refresh: bool = True) -> str:
     global DEFAULT_PAYOUT_WALLET
     if refresh:
-        load_client_config(force_reload=False, verbose=False)
+        load_client_config(force_reload=True, verbose=False)
     wallet = str(DEFAULT_PAYOUT_WALLET or "").strip()
     return wallet if wallet else "NO_WALLET_CONFIGURED"
 
@@ -614,6 +521,8 @@ PID = os.getpid()
 
 IS_PARENT_PROCESS = (mp.parent_process() is None)
 
+_log_fp = None
+
 if IS_PARENT_PROCESS:
     print("")
     print("====================================================")
@@ -625,9 +534,22 @@ if IS_PARENT_PROCESS:
     print("====================================================")
     print("")
 
+    _log_fp = open(
+        LOG_FILE,
+        "a",
+        buffering=1,
+        encoding="utf-8"
+    )
+
+    sys.stdout = Tee(sys.stdout, _log_fp)
+    sys.stderr = Tee(sys.stderr, _log_fp)
+    
+
+'''
 _log_fp = open(LOG_FILE, "w", buffering=1, encoding="utf-8")
 sys.stdout = Tee(sys.stdout, _log_fp)
 sys.stderr = Tee(sys.stderr, _log_fp)
+'''
 # --------------------------------------------------------------
 
 
@@ -1975,7 +1897,7 @@ def load_buffer_cores_from_file(default: int = 6, verbose: bool = False) -> int:
     Only prints when verbose=True.
     """
     try:
-        config = load_client_config(force_reload=False, verbose=False)
+        config = load_client_config(force_reload=True, verbose=False)
         used_encoding = _CLIENT_CONFIG_CACHE.get("encoding")
 
         if config is None:
@@ -2234,6 +2156,19 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
     watchdog_thread = None
     progress_bar = None
 
+    # Execution metadata reported to the master.
+    execution_workers_used = None
+    execution_available_cores = None
+    execution_total_cores = None
+    execution_buffer_cores = None
+    execution_backend = None
+    execution_shares_processed = 0
+    
+    # Separate actual processing completion from result serialization.
+    slave_processing_end_time = None
+    result_prepare_start_time = None
+    result_prepare_time_ms = None
+
 
     slave_receive_time = int(time.time() * 1000)  # Time when slave received work
     print(f"[WORK] Starting {work_id}: {work_name} ({work_type})")
@@ -2284,8 +2219,14 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             cpu_usage = psutil.cpu_percent(interval=1)
             available_cores = int((100 - cpu_usage) / 100 * total_cores)
             pool_size = max(1, min(available_cores - buffer_cores, work_shares))
+
+            execution_workers_used = pool_size
+            execution_available_cores = available_cores
+            execution_total_cores = total_cores
+            execution_buffer_cores = buffer_cores
+            execution_backend = "multiprocessing_pool"
             
-            print(f"[WORK] Using {pool_size} workers (available: {available_cores}, total: {total_cores})")
+            print(f"[WORK] Using {pool_size} workers (Available: {available_cores}, Total: {total_cores}, Buffer: {buffer_cores})")
 
             set_cores_used(pool_size, why=f"FE_Imprinting start work_id={work_id}")
 
@@ -2412,8 +2353,11 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
 
             if len(final_results) == len(Inputs):
                 work_success = True
+                execution_shares_processed = len(final_results)
             else:
                 work_success = False
+                execution_shares_processed = len(final_results or [])
+                
                 print(f"[WORK] Failed Work with ID {work_id}: {work_name} (Result Counts do not match)")
                 print(f"[WORK] Expected Count : {len(Inputs)} | Got Count :{len(final_results)}")
 
@@ -2499,6 +2443,13 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             available_cores = int((100 - cpu_usage) / 100 * total_cores)
             pool_size = max(1, min(available_cores - buffer_cores, total_subtasks))
 
+            execution_workers_used = pool_size
+            execution_available_cores = available_cores
+            execution_total_cores = total_cores
+            execution_buffer_cores = buffer_cores
+            execution_backend = "thread_pool_executor"
+            execution_shares_processed = total_subtasks
+
             set_cores_used(pool_size, why=f"Backtesting start work_id={work_id}")
             
             '''
@@ -2566,6 +2517,16 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
     status = "success" if work_success else "failure"
     if stopped_by_master:
         status = "stopped_by_master"
+
+    # Actual computational work has ended here.
+    slave_processing_end_time = int(time.time() * 1000)
+
+    reported_workers_used = (
+        int(execution_workers_used)
+        if execution_workers_used is not None
+        else None
+    )
+        
     set_cores_used(0, why=f"{work_type} end ({status}) work_id={work_id}")
     
     
@@ -2595,18 +2556,29 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
         safe_send(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
         return
 
-
+    result_prepare_start_time = int(time.time() * 1000)
 
     if work_type == "Backtesting":
         result_payload = {"ok": work_success, "count": len(final_results)}
     elif work_type == "FE_Imprinting":
         result_payload = serialize_dataframes(final_results)
+    else:
+        result_payload = final_results
+
+    result_prepare_time_ms = max(
+        0,
+        int(time.time() * 1000) - result_prepare_start_time
+    )
 
 
     default_payout_wallet = get_default_payout_wallet(refresh=True)
-    
-    slave_end_time = int(time.time() * 1000)  # Finished actual work
 
+    # Backward-compatible fallback.
+    if slave_processing_end_time is None:
+        slave_processing_end_time = int(time.time() * 1000)
+    
+    #slave_end_time = int(time.time() * 1000)  # Finished actual work
+    slave_end_time = slave_processing_end_time
     
     slave_send_time = int(time.time() * 1000)  # Time right before sending back
     
@@ -2622,7 +2594,23 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
                     "slave_start_time": slave_start_time,
                     "slave_end_time": slave_end_time,
                     "slave_send_time": slave_send_time,
-                    "default_payout_wallet": default_payout_wallet
+                    "default_payout_wallet": default_payout_wallet,
+                    # Optional protocol extension. Older masters can ignore this.
+                    "execution_stats": {
+                        "schema_version": 1,
+                        "workers_used": reported_workers_used,
+                        "shares_assigned": int(work_shares),
+                        "shares_processed": int(
+                            execution_shares_processed
+                            if execution_shares_processed is not None
+                            else 0
+                        ),
+                        "available_cores_at_start": execution_available_cores,
+                        "total_logical_cores": execution_total_cores,
+                        "buffer_cores": execution_buffer_cores,
+                        "parallel_backend": execution_backend,
+                        "result_prepare_time_ms": result_prepare_time_ms,
+                    },
                 }
 
     ack_event = threading.Event()
@@ -2760,7 +2748,9 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     # TLS context (reuse across retries)
     if is_domain(master_ip):
         # Public / DNS endpoint (relay etc.) → full verification
-        tls_context = create_verified_tls_context()
+        tls_context = ssl.create_default_context()
+        tls_context.check_hostname = True
+        tls_context.verify_mode = ssl.CERT_REQUIRED
     else:
         # Local IP / localhost → encrypt but don't enforce hostname/CA
         # (master generates its own self-signed cert on the fly)
@@ -2977,7 +2967,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     slave_id = msg["slave_id"]
                     print(f"[SLAVE] Assigned ID: {slave_id}")
                     
-                    buffer_cores = load_buffer_cores_from_file(default=6, verbose=False)
+                    buffer_cores = load_buffer_cores_from_file(default=4, verbose=False)
                     
                     sys_info = {
                                 "slave_id": slave_id,
@@ -3005,7 +2995,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     
                 elif msg.get("command") == "request_sys_info":
 
-                    buffer_cores = load_buffer_cores_from_file(default=6, verbose=False)
+                    buffer_cores = load_buffer_cores_from_file(default=4, verbose=False)
                     
                     sys_info = {
                                 "slave_id": slave_id,
