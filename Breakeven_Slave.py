@@ -36,6 +36,15 @@ from typing import Optional, Tuple, List
 import zstandard as zstd
 
 
+# In[ ]:
+
+
+try:
+    import certifi
+except Exception:
+    certifi = None
+
+
 # In[2]:
 
 
@@ -84,6 +93,11 @@ FINAL_RESULT_ACK_EVENTS = {}  # work_id -> threading.Event
 APPEND_WAITERS = {}  # req_id -> (Event, holder)
 
 
+
+_TLS_CA_BUNDLE_PATH = None
+_TLS_CA_BUNDLE_LOGGED = False_TLS_CA_BUNDLE_PATH = None
+_TLS_CA_BUNDLE_LOGGED = False
+
 # --- TIMEOUT CONFIG (slave side) ---------------------------------
 HEARTBEAT_INTERVAL = 10          # seconds
 POOL_TIMEOUT_SEC   = 5400        # 90 min – generous share-timeout
@@ -97,11 +111,100 @@ ACTIVE_WORKS = {}  # work_id -> control dict
 ACTIVE_WORKS_LOCK = threading.Lock()
 
 
+# In[ ]:
+
+
+def resolve_ca_bundle_path() -> Optional[str]:
+    candidates = []
+
+    for env_var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        env_path = str(os.environ.get(env_var) or "").strip()
+        if env_path:
+            candidates.append(env_path)
+
+    if certifi is not None:
+        try:
+            candidates.append(certifi.where())
+        except Exception:
+            pass
+
+    if getattr(sys, "frozen", False):
+        runtime_root = getattr(sys, "_MEIPASS", None)
+        if runtime_root:
+            candidates.extend([
+                os.path.join(runtime_root, "certifi", "cacert.pem"),
+                os.path.join(runtime_root, "cacert.pem"),
+            ])
+
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.extend([
+            os.path.join(exe_dir, "certifi", "cacert.pem"),
+            os.path.join(exe_dir, "cacert.pem"),
+        ])
+
+    candidates.extend([
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    ])
+
+    seen = set()
+    for candidate_path in candidates:
+        if not candidate_path:
+            continue
+        normalized = os.path.normcase(os.path.normpath(candidate_path))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.isfile(candidate_path):
+            return candidate_path
+
+    return None
+
+
+def get_tls_ca_bundle_path() -> Optional[str]:
+    global _TLS_CA_BUNDLE_PATH
+
+    if _TLS_CA_BUNDLE_PATH is None:
+        _TLS_CA_BUNDLE_PATH = resolve_ca_bundle_path()
+        if _TLS_CA_BUNDLE_PATH:
+            os.environ.setdefault("SSL_CERT_FILE", _TLS_CA_BUNDLE_PATH)
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", _TLS_CA_BUNDLE_PATH)
+
+    return _TLS_CA_BUNDLE_PATH
+
+
+def create_verified_tls_context() -> ssl.SSLContext:
+    global _TLS_CA_BUNDLE_LOGGED
+
+    tls_context = ssl.create_default_context()
+    tls_context.check_hostname = True
+    tls_context.verify_mode = ssl.CERT_REQUIRED
+
+    ca_bundle_path = get_tls_ca_bundle_path()
+    if ca_bundle_path:
+        tls_context.load_verify_locations(cafile=ca_bundle_path)
+        if not _TLS_CA_BUNDLE_LOGGED:
+            print(f"[TLS] CA bundle: {ca_bundle_path}")
+            _TLS_CA_BUNDLE_LOGGED = True
+    elif not _TLS_CA_BUNDLE_LOGGED:
+        print("[TLS][WARN] No explicit CA bundle found; using platform trust store only")
+        _TLS_CA_BUNDLE_LOGGED = True
+
+    return tls_context
+
+
 # In[2]:
 
 
 # Global session for ALL HTTP calls to MinIO (PUT/GET)
 _HTTP = requests.Session()
+
+_HTTP_VERIFY_BUNDLE = get_tls_ca_bundle_path()
+if _HTTP_VERIFY_BUNDLE:
+    _HTTP.verify = _HTTP_VERIFY_BUNDLE
+
 
 retries = Retry(
     total=5,
@@ -2748,9 +2851,12 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     # TLS context (reuse across retries)
     if is_domain(master_ip):
         # Public / DNS endpoint (relay etc.) → full verification
+        '''
         tls_context = ssl.create_default_context()
         tls_context.check_hostname = True
         tls_context.verify_mode = ssl.CERT_REQUIRED
+        '''
+        tls_context = create_verified_tls_context()
     else:
         # Local IP / localhost → encrypt but don't enforce hostname/CA
         # (master generates its own self-signed cert on the fly)
