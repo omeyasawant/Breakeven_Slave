@@ -305,8 +305,8 @@ def get_client_config_path() -> str:
     cwd = os.getcwd()
 
     candidates = [
-        os.path.abspath(os.path.join(base_dir, "client_config.json")),
         os.path.abspath(os.path.join(base_dir, "../client_config.json")),
+        os.path.abspath(os.path.join(base_dir, "client_config.json")),
         os.path.abspath(os.path.join(cwd, "client_config.json")),
         os.path.abspath(os.path.join(cwd, "../client_config.json")),
     ]
