@@ -3132,11 +3132,11 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             )
     
         # Wait for ACK
+        # ------------------------------------------------------------
+        # WAIT FOR MASTER ACK
+        # ------------------------------------------------------------
         if ack_event.wait(ACK_TIMEOUT_SEC):
-            '''
-            print(f"\n[FINAL] ACK received for work_id={work_id}")
-            break
-            '''
+            
             ack_received_at = _utc_now_iso()
 
             ack_received_time_ms = int(time.time() * 1000)
@@ -3182,39 +3182,12 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             )
         
             break
-        '''
-        else:
-            print(f"\n[FINAL] No ACK yet for work_id={work_id}; will retry...")
-            if attempt < MAX_RETRIES:
-                time.sleep(ACK_RETRY_DELAY_SEC)  # NEW delay
-        '''
+        
         else:
             print(
                 f"\n[FINAL][WARN] No ACK after {MAX_RETRIES} "
                 f"attempts for work_id={work_id}"
             )
-        
-            _record_update(work_id, {
-                "work": {
-                    "status": "result_ack_timeout"
-                },
-        
-                "result": {
-                    "result_ack_received": False,
-                    "master_ack_status": None,
-                    "master_status": "ack_timeout"
-                },
-        
-                "errors": [{
-                    "timestamp": _utc_now_iso(),
-                    "phase": "result_ack",
-                    "error_type": "ACKTimeout",
-                    "message": (
-                        f"No final_result_ack received after "
-                        f"{MAX_RETRIES} attempts"
-                    )
-                }]
-            })
         
             if attempt < MAX_RETRIES:
                 time.sleep(ACK_RETRY_DELAY_SEC)  # NEW delay
