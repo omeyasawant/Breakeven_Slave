@@ -3732,35 +3732,35 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                                     f"(keys={list(work_data.keys())[:5]})"
                                 )
 
-                        except Exception as e:
-                            print(f"[SLAVE][FETCH][ERROR] work_id={work_id}: {type(e).__name__}: {e}")
-                            traceback.print_exc()
-
-                            _work_record_error(
-                                work_id,
-                                e,
-                                phase="payload_fetch"
-                            )
-                            
-                            _record_update(work_id, {
-                                "work": {
-                                    "status": "payload_fetch_failed",
-                                    "work_success": False
-                                }
-                            })
-
-                            _work_record_error(
-                                work_id,
-                                e,
-                                phase="payload_fetch"
-                            )
-                            
-                            _record_update(work_id, {
-                                "work": {
-                                    "status": "payload_fetch_failed",
-                                    "work_success": False
-                                }
-                            })
+                            except Exception as e:
+                                print(f"[SLAVE][FETCH][ERROR] work_id={work_id}: {type(e).__name__}: {e}")
+                                traceback.print_exc()
+    
+                                _work_record_error(
+                                    work_id,
+                                    e,
+                                    phase="payload_fetch"
+                                )
+                                
+                                _record_update(work_id, {
+                                    "work": {
+                                        "status": "payload_fetch_failed",
+                                        "work_success": False
+                                    }
+                                })
+    
+                                _work_record_error(
+                                    work_id,
+                                    e,
+                                    phase="payload_fetch"
+                                )
+                                
+                                _record_update(work_id, {
+                                    "work": {
+                                        "status": "payload_fetch_failed",
+                                        "work_success": False
+                                    }
+                                })
                             
                             # Optionally report failure back to master
                             safe_send(client, {
@@ -3780,7 +3780,11 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                             dctx = zstd.ZstdDecompressor()
                             raw = dctx.decompress(compressed, max_output_size=work_data.get("orig_bytes", 5_000_000_000))
                             work_data = json.loads(raw.decode("utf-8"))
+                            
+                    
                     print(f"[SLAVE][ASSIGN_WORK] trace={msg.get('_trace_id')} work_id={msg.get('work_id')} packed={isinstance(msg.get('work_data'), dict) and msg['work_data'].get('compression')}")
+                    
+                    
                     threading.Thread(
                         target=do_work,
                         args=(client, work_id, work_name, work_type, work_data, work_shares, total_shares),
