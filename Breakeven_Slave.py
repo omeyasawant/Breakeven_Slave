@@ -89,7 +89,12 @@ CORES_USED_LOCK = threading.Lock()
 total_subtasks = 0
 completed = None
 WORK_STATUS = "idle"
-FINAL_RESULT_ACK_EVENTS = {}  # work_id -> threading.Event
+#FINAL_RESULT_ACK_EVENTS = {}  # work_id -> threading.Event
+FINAL_RESULT_ACK_EVENTS = {}
+# work_id -> {
+#     "event": threading.Event(),
+#     "message": None
+# }
 APPEND_WAITERS = {}  # req_id -> (Event, holder)
 
 
@@ -675,6 +680,235 @@ print(f"[SLAVE] Working dir   : {os.getcwd()}")
 print("====================================================")
 print("")
 '''
+
+
+# In[ ]:
+
+
+# ============================================================
+# WORK RECORD STORE
+# ============================================================
+
+WORK_RECORD_DIR = os.path.join(LOG_DIR, "work_records")
+os.makedirs(WORK_RECORD_DIR, exist_ok=True)
+
+_WORK_RECORD_LOCK = threading.RLock()
+
+
+def _work_record_path(work_id: str) -> str:
+    """
+    Return the JSON record path for a work_id.
+
+    Work IDs are sanitized so they cannot create arbitrary
+    paths inside the log directory.
+    """
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(work_id))
+    return os.path.join(WORK_RECORD_DIR, f"{safe_id}.json")
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _record_update(work_id: str, update: dict):
+    """
+    Atomically merge update into the existing work record.
+
+    Nested dictionaries are merged recursively.
+    """
+    if not work_id:
+        return
+
+    path = _work_record_path(work_id)
+    tmp_path = path + ".tmp"
+
+    with _WORK_RECORD_LOCK:
+        record = {}
+
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    record = json.load(f)
+            except Exception as e:
+                print(f"[WORK_RECORD][WARN] Failed reading {path}: {e}")
+                record = {}
+
+        def deep_merge(dst, src):
+            for key, value in src.items():
+                if (
+                    key in dst
+                    and isinstance(dst[key], dict)
+                    and isinstance(value, dict)
+                ):
+                    deep_merge(dst[key], value)
+                else:
+                    dst[key] = value
+
+        deep_merge(record, update)
+
+        record["schema_version"] = 1
+        record["updated_at"] = _utc_now_iso()
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(
+                record,
+                f,
+                indent=2,
+                ensure_ascii=False,
+                default=json_default
+            )
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_path, path)
+
+
+def _work_record_create(
+    work_id,
+    work_name,
+    work_type,
+    work_shares,
+    total_shares,
+    trace_id=None,
+    payload_bytes=None,
+    assignment_received_at=None
+):
+    now = _utc_now_iso()
+
+    share_percent = None
+    try:
+        if int(total_shares) > 0:
+            share_percent = (
+                int(work_shares) / int(total_shares)
+            ) * 100
+    except Exception:
+        pass
+
+    record = {
+        "schema_version": 1,
+
+        "work": {
+            "work_id": work_id,
+            "work_name": work_name,
+            "work_type": work_type,
+            "trace_id": trace_id,
+            "status": "received",
+            "work_success": None
+        },
+
+        "slave": {
+            "slave_id": slave_id,
+            "slave_name": slave_name,
+            "version": version,
+            "machine_uid": get_machine_uid(),
+            "hostname": socket.gethostname(),
+            "pid": os.getpid()
+        },
+
+        "allocation": {
+            "shares_assigned": int(work_shares),
+            "total_shares": int(total_shares),
+            "share_percent": share_percent,
+            "shares_processed": 0,
+            "payload_bytes": payload_bytes,
+            "payload_mb": (
+                round(payload_bytes / (1024 * 1024), 3)
+                if payload_bytes else None
+            )
+        },
+
+        "timing": {
+            "work_received": assignment_received_at or now
+        },
+
+        "execution": {
+            "workers_used": None,
+            "peak_cores_used": 0,
+            "available_cores_at_start": None,
+            "total_logical_cores": None,
+            "buffer_cores": None,
+            "parallel_backend": None
+        },
+
+        "result": {
+            "result_sent": False,
+            "send_attempts": 0,
+            "result_ack_received": False,
+            "master_status": None,
+            "master_ack_message": None
+        },
+
+        "payout": {
+            "wallet": None
+        },
+
+        "termination": {
+            "terminated_by_master": False,
+            "termination_reason": None,
+            "termination_time": None,
+            "termination_progress_percent": None
+        },
+
+        "errors": [],
+
+        "created_at": now,
+        "updated_at": now
+    }
+
+    _record_update(work_id, record)
+
+
+def _work_record_error(work_id, error, phase=None):
+    entry = {
+        "timestamp": _utc_now_iso(),
+        "phase": phase,
+        "error_type": type(error).__name__,
+        "message": str(error)
+    }
+
+    path = _work_record_path(work_id)
+
+    with _WORK_RECORD_LOCK:
+        record = {}
+
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    record = json.load(f)
+            except Exception:
+                record = {}
+
+        record.setdefault("errors", []).append(entry)
+        record["updated_at"] = _utc_now_iso()
+        record["schema_version"] = 1
+
+        tmp_path = path + ".tmp"
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(
+                record,
+                f,
+                indent=2,
+                ensure_ascii=False,
+                default=json_default
+            )
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_path, path)
+
+
+# In[ ]:
+
+
+def _duration_ms(start_ms, end_ms):
+        if start_ms is None or end_ms is None:
+            return None
+    
+        try:
+            return max(0, int(end_ms - start_ms))
+        except Exception:
+            return None
 
 
 # ## Messaging Protocols
@@ -2065,6 +2299,30 @@ def _stop_active_work(work_id: str, reason: str = "stop_work"):
 
     print(f"[STOP_WORK] Received stop for work_id={work_id} reason={reason}")
 
+    # Persist master termination immediately.
+    # This is intentionally done BEFORE killing the pool.
+    termination_progress = None
+    
+    try:
+        progress_fn = ctrl.get("get_progress")
+        if progress_fn:
+            termination_progress = progress_fn()
+    except Exception:
+        pass
+    
+    _record_update(work_id, {
+        "work": {
+            "status": "stopped_by_master"
+        },
+        "termination": {
+            "terminated_by_master": True,
+            "termination_reason": reason,
+            "termination_time": _utc_now_iso(),
+            "termination_progress_percent": termination_progress
+        }
+    })
+    
+
     # cooperative signal
     try:
         ev = ctrl.get("stop_event")
@@ -2240,10 +2498,10 @@ def process_wrapper(input_df,input_resample_timeframe):
         return pd.DataFrame()
 
 
-# In[38]:
+# In[2]:
 
 
-def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_shares,api_token=None, token_expiry_unix=None, allowed_output_prefix=None):
+def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_shares,api_token=None, token_expiry_unix=None, allowed_output_prefix=None,assignment_received_at=None):
     global buffer_cores
     global completed
     global total_subtasks
@@ -2273,7 +2531,20 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
     result_prepare_time_ms = None
 
 
-    slave_receive_time = int(time.time() * 1000)  # Time when slave received work
+    #slave_receive_time = int(time.time() * 1000)  # Time when slave received work
+    if assignment_received_at:
+        try:
+            assignment_dt = datetime.datetime.fromisoformat(
+                assignment_received_at
+            )
+            slave_receive_time = int(
+                assignment_dt.timestamp() * 1000
+            )
+        except Exception:
+            slave_receive_time = int(time.time() * 1000)
+    else:
+        slave_receive_time = int(time.time() * 1000)
+        
     print(f"[WORK] Starting {work_id}: {work_name} ({work_type})")
 
     # Safe cast to int (and avoid divide by zero)
@@ -2285,6 +2556,17 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
     stopped_by_master = False
     
     slave_start_time = int(time.time() * 1000)  # Time when starting actual work
+
+    work_started_at = _utc_now_iso()
+
+    _record_update(work_id, {
+        "work": {
+            "status": "working"
+        },
+        "timing": {
+            "work_started": work_started_at
+        }
+    })
 
     WORK_STATUS = "working"
     #send_message(conn, {"slave_id": slave_id, "work_status": WORK_STATUS})
@@ -2300,6 +2582,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
         "child_pids": [],
         "progress_stop_event": None,
         "watchdog_stop_event": None,
+        "get_progress": None,
     }
     _register_active_work(work_id, control)
 
@@ -2333,10 +2616,22 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
 
             set_cores_used(pool_size, why=f"FE_Imprinting start work_id={work_id}")
 
+            _record_update(work_id, {
+                "execution": {
+                    "workers_used": int(pool_size),
+                    "peak_cores_used": int(pool_size),
+                    "available_cores_at_start": int(available_cores),
+                    "total_logical_cores": int(total_cores),
+                    "buffer_cores": int(buffer_cores),
+                    "parallel_backend": "multiprocessing_pool"
+                }
+            })
+
 
             # --- Progress tracking ---
             total_subtasks = len(Inputs)
             completed = mp.Value('i', 0)  # Shared counter
+            control["get_progress"] = get_progress
             
             # --- Start Heartbeat ---
             stop_event = threading.Event()
@@ -2483,6 +2778,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
         
             total_subtasks = len(tasks)
             completed = mp.Value('i', 0)
+            control["get_progress"] = get_progress
         
             stop_event = threading.Event()
             control["heartbeat_stop_event"] = stop_event
@@ -2554,6 +2850,19 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             execution_shares_processed = total_subtasks
 
             set_cores_used(pool_size, why=f"Backtesting start work_id={work_id}")
+
+
+            _record_update(work_id, {
+                "execution": {
+                    "workers_used": int(pool_size),
+                    "peak_cores_used": int(pool_size),
+                    "available_cores_at_start": int(available_cores),
+                    "total_logical_cores": int(total_cores),
+                    "buffer_cores": int(buffer_cores),
+                    "parallel_backend": "thread_pool_executor"
+                }
+            })
+            
             
             '''
             def bt_wrapper(flag, tm_params, verbose):
@@ -2621,8 +2930,32 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
     if stopped_by_master:
         status = "stopped_by_master"
 
+    _record_update(work_id, {
+        "work": {
+            "status": status,
+            "work_success": bool(work_success)
+        }
+    })
+
     # Actual computational work has ended here.
     slave_processing_end_time = int(time.time() * 1000)
+
+
+    processing_completed_at = _utc_now_iso()
+
+    _record_update(work_id, {
+        "allocation": {
+            "shares_processed": int(
+                execution_shares_processed
+                if execution_shares_processed is not None
+                else 0
+            )
+        },
+        "timing": {
+            "processing_completed": processing_completed_at
+        }
+    })
+    
 
     reported_workers_used = (
         int(execution_workers_used)
@@ -2661,6 +2994,12 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
 
     result_prepare_start_time = int(time.time() * 1000)
 
+    _record_update(work_id, {
+        "timing": {
+            "result_preparation_started": _utc_now_iso()
+        }
+    })
+
     if work_type == "Backtesting":
         result_payload = {"ok": work_success, "count": len(final_results)}
     elif work_type == "FE_Imprinting":
@@ -2673,8 +3012,19 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
         int(time.time() * 1000) - result_prepare_start_time
     )
 
+    _record_update(work_id, {
+        "timing": {
+            "result_prepared": _utc_now_iso()
+        }
+    })
 
     default_payout_wallet = get_default_payout_wallet(refresh=True)
+
+    _record_update(work_id, {
+        "payout": {
+            "wallet": default_payout_wallet
+        }
+    })
 
     # Backward-compatible fallback.
     if slave_processing_end_time is None:
@@ -2715,33 +3065,221 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
                         "result_prepare_time_ms": result_prepare_time_ms,
                     },
                 }
-
+    '''
     ack_event = threading.Event()
     FINAL_RESULT_ACK_EVENTS[work_id] = ack_event
+    '''
+
+    ack_event = threading.Event()
+
+    ack_state = {
+        "event": ack_event,
+        "message": None
+    }
+    
+    FINAL_RESULT_ACK_EVENTS[work_id] = ack_state
+
     
     MAX_RETRIES = 4
     ACK_TIMEOUT_SEC = 450  # wait per attempt
     ACK_RETRY_DELAY_SEC = 150  # NEW: wait 2 minutes between attempts (tune)
 
+
+    first_result_send_at = None
     for attempt in range(1, MAX_RETRIES + 1):
-        try:
+        try:   
+            
             #send_message(conn, final_packet)
             safe_send(conn, final_packet)
             print(f"\n[FINAL] Sent final result for work_id={work_id} (attempt {attempt}/{MAX_RETRIES})")
+
+            if first_result_send_at is None:
+                first_result_send_at = _utc_now_iso()
+            
+            _record_update(work_id, {
+                "result": {
+                    "send_attempts": attempt,
+                    "last_send_attempt": attempt
+                    "result_sent": True
+                },
+                "timing": {
+                    "result_first_sent": first_result_send_at,
+                    "result_last_sent": _utc_now_iso()
+                }
+            })
+        
+            
         except Exception as e:
             print(f"\n[FINAL][ERROR] send failed for work_id={work_id} (attempt {attempt}/{MAX_RETRIES}): {e}")
+
+            _record_update(work_id, {
+                "result": {
+                    "last_send_error": str(e),
+                    "last_send_error_type": type(e).__name__
+                }
+            })
+            
+            _work_record_error(
+                work_id,
+                e,
+                phase=f"result_send_attempt_{attempt}"
+            )
     
         # Wait for ACK
         if ack_event.wait(ACK_TIMEOUT_SEC):
+            '''
             print(f"\n[FINAL] ACK received for work_id={work_id}")
             break
+            '''
+            ack_received_at = _utc_now_iso()
+
+            ack_received_time_ms = int(time.time() * 1000)
+
+            ack_latency_ms = max(
+                0,
+                ack_received_time_ms - slave_send_time
+            )
+
+            ack_message = ack_state.get("message") or {}
+
+            master_ack_status = ack_message.get("status")
+            
+            if master_ack_status == "ok":
+                master_status = "accepted"
+            else:
+                master_status = "rejected"
+        
+            _record_update(work_id, {
+                "result": {
+                    "result_ack_received": True,
+            
+                    # Raw protocol response from Master
+                    "master_ack_status": master_ack_status,
+            
+                    # Normalized analytical status
+                    "master_status": master_status,
+            
+                    # Preserve complete ACK for debugging/auditing
+                    "master_ack_message": ack_message
+                },
+            
+                "timing": {
+                    "ack_received": ack_received_at,
+                    "ack_latency_ms": ack_latency_ms
+                }
+            })
+        
+            print(
+                f"\n[FINAL] ACK received for work_id={work_id} "
+                f"status={master_status}"
+                f"raw_status={master_ack_status}"
+            )
+        
+            break
+        '''
         else:
             print(f"\n[FINAL] No ACK yet for work_id={work_id}; will retry...")
             if attempt < MAX_RETRIES:
                 time.sleep(ACK_RETRY_DELAY_SEC)  # NEW delay
+        '''
+        else:
+            print(
+                f"\n[FINAL][WARN] No ACK after {MAX_RETRIES} "
+                f"attempts for work_id={work_id}"
+            )
+        
+            _record_update(work_id, {
+                "work": {
+                    "status": "result_ack_timeout"
+                },
+        
+                "result": {
+                    "result_ack_received": False,
+                    "master_ack_status": None,
+                    "master_status": "ack_timeout"
+                },
+        
+                "errors": [{
+                    "timestamp": _utc_now_iso(),
+                    "phase": "result_ack",
+                    "error_type": "ACKTimeout",
+                    "message": (
+                        f"No final_result_ack received after "
+                        f"{MAX_RETRIES} attempts"
+                    )
+                }]
+            })
+        
+            if attempt < MAX_RETRIES:
+                time.sleep(ACK_RETRY_DELAY_SEC)  # NEW delay
 
-    # Clean up event
+        
+    # ------------------------------------------------------------
+    # FINALIZE WORK RECORD
+    # ------------------------------------------------------------
+    
+    ack_received = ack_event.is_set()
+    
+    ack_message = ack_state.get("message") or {}
+    master_ack_status = ack_message.get("status")
+    
+    if ack_received and master_ack_status == "ok":
+        final_work_status = "accepted"
+        normalized_master_status = "accepted"
+
+    elif ack_received:
+        final_work_status = "rejected"
+        normalized_master_status = "rejected"
+    
+    else:
+        final_work_status = "result_ack_timeout"
+        normalized_master_status = "ack_timeout"
+
+
+    # ------------------------------------------------------------
+    # FINAL TIMING METRICS
+    # ------------------------------------------------------------
+    _record_update(work_id, {
+        "work": {
+            "status": final_work_status,
+            "work_success": bool(work_success)
+        },
+    
+        "result": {
+            "result_ack_received": ack_received,
+            "master_ack_status": master_ack_status,
+            "master_status": normalized_master_status,
+            "master_ack_message": ack_message
+        },
+        "timing": {
+            "queue_delay_ms": _duration_ms(
+                slave_receive_time,
+                slave_start_time
+            ),
+    
+            "processing_ms": _duration_ms(
+                slave_start_time,
+                slave_processing_end_time
+            ),
+    
+            "processing_to_result_send_ms": _duration_ms(
+                slave_processing_end_time,
+                slave_send_time
+            ),
+    
+            "total_slave_turnaround_ms": _duration_ms(
+                slave_receive_time,
+                slave_send_time
+            )
+        }
+    })
+    
+    
+    # Clean up in-memory ACK state only AFTER
+    # the persistent Work Record has been finalized.
     FINAL_RESULT_ACK_EVENTS.pop(work_id, None)
+
+    
 
     # Only now consider changing local status/heartbeat
     if ack_event.is_set():
@@ -3139,6 +3677,33 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     api_token = msg.get("api_token")
                     token_expiry_unix = msg.get("token_expiry_unix")
                     allowed_output_prefix = msg.get("allowed_output_prefix")
+
+
+                    # ------------------------------------------------------------
+                    # WORK RECORD: assignment received
+                    # ------------------------------------------------------------
+                    
+                    assignment_received_at = _utc_now_iso()
+                    
+                    payload_ref = msg.get("payload_ref")
+                    payload_bytes = None
+                    
+                    if payload_ref:
+                        try:
+                            payload_bytes = int(payload_ref.get("bytes", 0) or 0)
+                        except Exception:
+                            payload_bytes = None
+                    
+                    _work_record_create(
+                        work_id=work_id,
+                        work_name=work_name,
+                        work_type=work_type,
+                        work_shares=work_shares,
+                        total_shares=total_shares,
+                        trace_id=msg.get("_trace_id"),
+                        payload_bytes=payload_bytes,
+                        assignment_received_at=assignment_received_at
+                    )
                     
 
                     '''
@@ -3160,9 +3725,64 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                         try:
                             work_data = fetch_payload_ref(payload_ref)
                             print(f"[SLAVE][FETCH] work_id={work_id} payload OK (keys={list(work_data.keys())[:5]})")
+
+                            payload_fetch_start = time.time()
+
+                            _record_update(work_id, {
+                                "timing": {
+                                    "payload_fetch_start": _utc_now_iso()
+                                }
+                            })
+                            
+                            try:
+                                work_data = fetch_payload_ref(payload_ref)
+                            
+                                payload_fetch_end = time.time()
+                            
+                                _record_update(work_id, {
+                                    "timing": {
+                                        "payload_fetch_end": _utc_now_iso(),
+                                        "payload_fetch_ms": int(
+                                            (payload_fetch_end - payload_fetch_start) * 1000
+                                        )
+                                    }
+                                })
+                            
+                                print(
+                                    f"[SLAVE][FETCH] work_id={work_id} payload OK "
+                                    f"(keys={list(work_data.keys())[:5]})"
+                                )
+
                         except Exception as e:
                             print(f"[SLAVE][FETCH][ERROR] work_id={work_id}: {type(e).__name__}: {e}")
                             traceback.print_exc()
+
+                            _work_record_error(
+                                work_id,
+                                e,
+                                phase="payload_fetch"
+                            )
+                            
+                            _record_update(work_id, {
+                                "work": {
+                                    "status": "payload_fetch_failed",
+                                    "work_success": False
+                                }
+                            })
+
+                            _work_record_error(
+                                work_id,
+                                e,
+                                phase="payload_fetch"
+                            )
+                            
+                            _record_update(work_id, {
+                                "work": {
+                                    "status": "payload_fetch_failed",
+                                    "work_success": False
+                                }
+                            })
+                            
                             # Optionally report failure back to master
                             safe_send(client, {
                                 "slave_id": slave_id,
@@ -3189,6 +3809,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                             "api_token": api_token,
                             "token_expiry_unix": token_expiry_unix,
                             "allowed_output_prefix": allowed_output_prefix,
+                            "assignment_received_at": assignment_received_at,
                         },
                         daemon=True
                     ).start()
@@ -3233,16 +3854,29 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                         })
                     continue
 
-
-                    
+                
+                '''    
                 elif msg.get("stream_type") == "final_result_ack":
                     wid = msg.get("work_id")
                     ev = FINAL_RESULT_ACK_EVENTS.get(wid)
                     if ev:
                         ev.set()
                         print(f"[ACK] Master acknowledged final result for work_id={wid}")
-
-    
+                '''
+                elif msg.get("stream_type") == "final_result_ack":
+                    wid = msg.get("work_id")
+                
+                    ack_state = FINAL_RESULT_ACK_EVENTS.get(wid)
+                
+                    if ack_state:
+                        ack_state["message"] = msg
+                        ack_state["event"].set()
+                
+                        print(
+                            f"[ACK] Master acknowledged final result "
+                            f"for work_id={wid}"
+                        )
+                
             
             except socket.timeout:
                 #continue
