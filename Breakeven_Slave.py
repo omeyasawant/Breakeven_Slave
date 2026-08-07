@@ -329,6 +329,12 @@ def get_client_config_path() -> str:
     return os.path.abspath(os.path.join(base_dir, "client_config.json"))
 
 
+# In[ ]:
+
+
+
+
+
 # In[5]:
 
 
@@ -434,6 +440,19 @@ def get_default_payout_wallet(refresh: bool = True) -> str:
         load_client_config(force_reload=True, verbose=False)
     wallet = str(DEFAULT_PAYOUT_WALLET or "").strip()
     return wallet if wallet else "NO_WALLET_CONFIGURED"
+
+
+# In[ ]:
+
+
+def _duration_ms(start_ms, end_ms):
+        if start_ms is None or end_ms is None:
+            return None
+    
+        try:
+            return max(0, int(end_ms - start_ms))
+        except Exception:
+            return None
 
 
 # ## Connection DEBUGS
@@ -896,19 +915,6 @@ def _work_record_error(work_id, error, phase=None):
             os.fsync(f.fileno())
 
         os.replace(tmp_path, path)
-
-
-# In[ ]:
-
-
-def _duration_ms(start_ms, end_ms):
-        if start_ms is None or end_ms is None:
-            return None
-    
-        try:
-            return max(0, int(end_ms - start_ms))
-        except Exception:
-            return None
 
 
 # ## Messaging Protocols
@@ -3099,7 +3105,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             _record_update(work_id, {
                 "result": {
                     "send_attempts": attempt,
-                    "last_send_attempt": attempt
+                    "last_send_attempt": attempt,
                     "result_sent": True
                 },
                 "timing": {
