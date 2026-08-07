@@ -3838,14 +3838,7 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     continue
 
                 
-                '''    
-                elif msg.get("stream_type") == "final_result_ack":
-                    wid = msg.get("work_id")
-                    ev = FINAL_RESULT_ACK_EVENTS.get(wid)
-                    if ev:
-                        ev.set()
-                        print(f"[ACK] Master acknowledged final result for work_id={wid}")
-                '''
+                
                 elif msg.get("stream_type") == "final_result_ack":
                     wid = msg.get("work_id")
                 
