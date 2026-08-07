@@ -3701,67 +3701,67 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     payload_ref = msg.get("payload_ref")
                     if payload_ref:
                         print(f"[SLAVE][FETCH] work_id={work_id} downloading payload from url (zstd+json)")
+                        '''
+                        work_data = fetch_payload_ref(payload_ref)
+                        print(f"[SLAVE][FETCH] work_id={work_id} payload OK (keys={list(work_data.keys())[:5]})")
+                        '''
+                        payload_fetch_start = time.time()
+
+                        _record_update(work_id, {
+                            "timing": {
+                                "payload_fetch_start": _utc_now_iso()
+                            }
+                        })
+                        
                         try:
                             work_data = fetch_payload_ref(payload_ref)
-                            print(f"[SLAVE][FETCH] work_id={work_id} payload OK (keys={list(work_data.keys())[:5]})")
-
-                            payload_fetch_start = time.time()
-
+                            
+                            payload_fetch_end = time.time()
+                        
                             _record_update(work_id, {
                                 "timing": {
-                                    "payload_fetch_start": _utc_now_iso()
+                                    "payload_fetch_end": _utc_now_iso(),
+                                    "payload_fetch_ms": int(
+                                        (payload_fetch_end - payload_fetch_start) * 1000
+                                    )
                                 }
                             })
-                            
-                            try:
-                                work_data = fetch_payload_ref(payload_ref)
-                            
-                                payload_fetch_end = time.time()
-                            
-                                _record_update(work_id, {
-                                    "timing": {
-                                        "payload_fetch_end": _utc_now_iso(),
-                                        "payload_fetch_ms": int(
-                                            (payload_fetch_end - payload_fetch_start) * 1000
-                                        )
-                                    }
-                                })
-                            
-                                print(
-                                    f"[SLAVE][FETCH] work_id={work_id} payload OK "
-                                    f"(keys={list(work_data.keys())[:5]})"
-                                )
+                        
+                            print(
+                                f"[SLAVE][FETCH] work_id={work_id} payload OK "
+                                f"(keys={list(work_data.keys())[:5]})"
+                            )
 
-                            except Exception as e:
-                                print(f"[SLAVE][FETCH][ERROR] work_id={work_id}: {type(e).__name__}: {e}")
-                                traceback.print_exc()
-    
-                                _work_record_error(
-                                    work_id,
-                                    e,
-                                    phase="payload_fetch"
-                                )
-                                
-                                _record_update(work_id, {
-                                    "work": {
-                                        "status": "payload_fetch_failed",
-                                        "work_success": False
-                                    }
-                                })
-    
-                                _work_record_error(
-                                    work_id,
-                                    e,
-                                    phase="payload_fetch"
-                                )
-                                
-                                _record_update(work_id, {
-                                    "work": {
-                                        "status": "payload_fetch_failed",
-                                        "work_success": False
-                                    }
-                                })
+                        except Exception as e:
+                            print(f"[SLAVE][FETCH][ERROR] work_id={work_id}: {type(e).__name__}: {e}")
+                            traceback.print_exc()
+
+                            _work_record_error(
+                                work_id,
+                                e,
+                                phase="payload_fetch"
+                            )
                             
+                            _record_update(work_id, {
+                                "work": {
+                                    "status": "payload_fetch_failed",
+                                    "work_success": False
+                                }
+                            })
+
+                            _work_record_error(
+                                work_id,
+                                e,
+                                phase="payload_fetch"
+                            )
+                            
+                            _record_update(work_id, {
+                                "work": {
+                                    "status": "payload_fetch_failed",
+                                    "work_success": False
+                                }
+                            })
+                        
                             # Optionally report failure back to master
                             safe_send(client, {
                                 "slave_id": slave_id,
