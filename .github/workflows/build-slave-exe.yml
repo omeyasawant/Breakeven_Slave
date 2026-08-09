@@ -25,7 +25,7 @@ jobs:
 
           - os: macos-15-intel
             artifact_suffix: macos
-            upload_path: dist/Breakeven_Slave.app.zip
+            upload_path: dist/Breakeven_Slave.pkg
 
     steps:
       - name: Checkout
@@ -71,6 +71,7 @@ jobs:
           P12_PASSWORD: ${{ secrets.APPLE_BUILD_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_INSTALLER_SIGNING_IDENTITY: ${{ secrets.APPLE_INSTALLER_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -78,6 +79,7 @@ jobs:
           set -euo pipefail
 
           echo "MACOS_SIGNING_ENABLED=false" >> "$GITHUB_ENV"
+          echo "MACOS_PKG_SIGNING_ENABLED=false" >> "$GITHUB_ENV"
           echo "MACOS_NOTARIZATION_ENABLED=false" >> "$GITHUB_ENV"
 
           missing=()
@@ -111,10 +113,17 @@ jobs:
           echo "MACOS_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
           echo "MACOS_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
-          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+          if [ -n "${APPLE_INSTALLER_SIGNING_IDENTITY:-}" ]; then
+            echo "MACOS_PKG_SIGNING_ENABLED=true" >> "$GITHUB_ENV"
+            echo "MACOS_PKG_SIGNING_IDENTITY=$APPLE_INSTALLER_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          else
+            echo "::warning::APPLE_INSTALLER_SIGNING_IDENTITY is missing. The macOS .pkg will be built unsigned."
+          fi
+
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APPLE_INSTALLER_SIGNING_IDENTITY:-}" ]; then
             echo "MACOS_NOTARIZATION_ENABLED=true" >> "$GITHUB_ENV"
           else
-            echo "::warning::Apple notarization secrets missing (APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, or APPLE_TEAM_ID). App will be Developer ID signed but not notarized."
+            echo "::warning::Apple notarization secrets or APPLE_INSTALLER_SIGNING_IDENTITY are missing. The macOS .pkg will not be notarized."
           fi
 
 
@@ -125,7 +134,7 @@ jobs:
         run: |
           python -m PyInstaller --onefile Breakeven_Slave.py             --name Breakeven_Slave                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
 
-      - name: Build (macOS .app zip)
+      - name: Build (macOS .pkg)
         if: runner.os == 'macOS'
         shell: bash -l {0}
         run: |
@@ -163,10 +172,16 @@ jobs:
           # Build an x86_64 app bundle (runs on Intel and on Apple Silicon via Rosetta)
           python -m PyInstaller --onedir --windowed Breakeven_Slave.py             --name Breakeven_Slave                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil             "${PYINSTALLER_MAC_ARGS[@]}"
 
-          # Zip the .app for easy distribution
-          ditto -c -k --sequesterRsrc --keepParent "dist/Breakeven_Slave.app" "dist/Breakeven_Slave.app.zip"
+          PACKAGE_VERSION="${BREAKEVEN_PKG_VERSION:-1.0.0}"
 
-      - name: Notarize macOS app bundle
+          if [ "${MACOS_PKG_SIGNING_ENABLED:-false}" = "true" ]; then
+            pkgbuild               --component "dist/Breakeven_Slave.app"               --install-location "/Applications"               --identifier "com.breakeven.slave.pkg"               --version "$PACKAGE_VERSION"               --sign "$MACOS_PKG_SIGNING_IDENTITY"               "dist/Breakeven_Slave.pkg"
+          else
+            echo "::warning::Building Breakeven_Slave.pkg without Developer ID Installer signing."
+            pkgbuild               --component "dist/Breakeven_Slave.app"               --install-location "/Applications"               --identifier "com.breakeven.slave.pkg"               --version "$PACKAGE_VERSION"               "dist/Breakeven_Slave.pkg"
+          fi
+
+      - name: Notarize macOS package
         if: runner.os == 'macOS'
         shell: bash -l {0}
         env:
@@ -175,14 +190,13 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           if [ "${MACOS_NOTARIZATION_ENABLED:-false}" != "true" ]; then
-            echo "::warning::Skipping notarization for Breakeven_Slave because Apple ID notarization secrets are unavailable."
+            echo "::warning::Skipping notarization for Breakeven_Slave.pkg because notarization prerequisites are unavailable."
             exit 0
           fi
 
-          xcrun notarytool submit "dist/Breakeven_Slave.app.zip"             --apple-id "$APPLE_ID"             --password "$APPLE_APP_SPECIFIC_PASSWORD"             --team-id "$APPLE_TEAM_ID"             --wait
+          xcrun notarytool submit "dist/Breakeven_Slave.pkg"             --apple-id "$APPLE_ID"             --password "$APPLE_APP_SPECIFIC_PASSWORD"             --team-id "$APPLE_TEAM_ID"             --wait
 
-          xcrun stapler staple "dist/Breakeven_Slave.app"
-          ditto -c -k --sequesterRsrc --keepParent "dist/Breakeven_Slave.app" "dist/Breakeven_Slave.app.zip"
+          xcrun stapler staple "dist/Breakeven_Slave.pkg"
 
       - name: Clean up macOS signing keychain
         if: runner.os == 'macOS' && always()
