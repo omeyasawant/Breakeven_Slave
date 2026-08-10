@@ -175,10 +175,10 @@ jobs:
           PACKAGE_VERSION="${BREAKEVEN_PKG_VERSION:-1.0.0}"
 
           if [ "${MACOS_PKG_SIGNING_ENABLED:-false}" = "true" ]; then
-            pkgbuild               --component "dist/Breakeven_Slave.app"               --install-location "/Applications"               --identifier "com.breakeven.slave.pkg"               --version "$PACKAGE_VERSION"               --sign "$MACOS_PKG_SIGNING_IDENTITY"               "dist/Breakeven_Slave.pkg"
+            pkgbuild               --component "dist/Breakeven_Slave.app"               --install-location "/Library/Application Support/BreakEvenClient/client_service"               --identifier "com.breakeven.slave.pkg"               --version "$PACKAGE_VERSION"               --sign "$MACOS_PKG_SIGNING_IDENTITY"               "dist/Breakeven_Slave.pkg"
           else
             echo "::warning::Building Breakeven_Slave.pkg without Developer ID Installer signing."
-            pkgbuild               --component "dist/Breakeven_Slave.app"               --install-location "/Applications"               --identifier "com.breakeven.slave.pkg"               --version "$PACKAGE_VERSION"               "dist/Breakeven_Slave.pkg"
+            pkgbuild               --component "dist/Breakeven_Slave.app"               --install-location "/Library/Application Support/BreakEvenClient/client_service"               --identifier "com.breakeven.slave.pkg"               --version "$PACKAGE_VERSION"               "dist/Breakeven_Slave.pkg"
           fi
 
       - name: Notarize macOS package
