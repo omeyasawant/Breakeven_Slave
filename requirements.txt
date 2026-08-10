@@ -9,6 +9,7 @@ pandas-ta==0.3.14b0
 pandas==1.5.3
 numpy==1.24.4
 numba==0.57.1
+setuptools
 scipy
 plotly
 seaborn

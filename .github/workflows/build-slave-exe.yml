@@ -132,7 +132,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash -l {0}
         run: |
-          python -m PyInstaller --onefile Breakeven_Slave.py             --name Breakeven_Slave                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting             --hidden-import pkg_resources             --hidden-import setuptools             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
+          python -m PyInstaller --onefile Breakeven_Slave.py             --name Breakeven_Slave                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting             --collect-submodules pkg_resources             --copy-metadata setuptools             --copy-metadata pandas-ta             --hidden-import pkg_resources             --hidden-import setuptools             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
 
       - name: Build (macOS .pkg)
         if: runner.os == 'macOS'
@@ -170,7 +170,7 @@ jobs:
           fi
 
           # Build an x86_64 app bundle (runs on Intel and on Apple Silicon via Rosetta)
-          python -m PyInstaller --onedir --windowed Breakeven_Slave.py             --name Breakeven_Slave                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting             --hidden-import pkg_resources             --hidden-import setuptools             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil             "${PYINSTALLER_MAC_ARGS[@]}"
+          python -m PyInstaller --onedir --windowed Breakeven_Slave.py             --name Breakeven_Slave                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting             --collect-submodules pkg_resources             --copy-metadata setuptools             --copy-metadata pandas-ta             --hidden-import pkg_resources             --hidden-import setuptools             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil             "${PYINSTALLER_MAC_ARGS[@]}"
 
           PACKAGE_VERSION="${BREAKEVEN_PKG_VERSION:-1.0.0}"
 
@@ -210,7 +210,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash -l {0}
         run: |
-          python -m PyInstaller --onefile Breakeven_Slave.py             --name Breakeven_Slave                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting             --hidden-import pkg_resources             --hidden-import setuptools             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
+          python -m PyInstaller --onefile Breakeven_Slave.py             --name Breakeven_Slave                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting             --collect-submodules pkg_resources             --copy-metadata setuptools             --copy-metadata pandas-ta             --hidden-import pkg_resources             --hidden-import setuptools             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
 
           # Create AppDir layout
           rm -rf AppDir
