@@ -19,6 +19,9 @@
 
 
 import os
+import sys
+import types
+from importlib import metadata as importlib_metadata
 '''
 import torch
 import torch.nn as nn
@@ -26,6 +29,40 @@ import torch.optim as optim
 '''
 import numpy as np
 import pandas as pd
+
+
+def ensure_pkg_resources_compat():
+  try:
+    import pkg_resources  # noqa: F401
+    return
+  except ModuleNotFoundError:
+    pass
+
+  shim = types.ModuleType("pkg_resources")
+
+  class DistributionNotFound(Exception):
+    pass
+
+  class _Distribution:
+    def __init__(self, package_name: str):
+      try:
+        distribution = importlib_metadata.distribution(package_name)
+        self.version = distribution.version
+        self.location = str(distribution.locate_file(""))
+      except importlib_metadata.PackageNotFoundError:
+        self.version = "0.0.0"
+        self.location = os.getcwd()
+
+  def get_distribution(package_name: str):
+    return _Distribution(package_name)
+
+  shim.DistributionNotFound = DistributionNotFound
+  shim.get_distribution = get_distribution
+  sys.modules["pkg_resources"] = shim
+
+
+ensure_pkg_resources_compat()
+
 import pandas_ta as ta
 import datetime
 import pickle
