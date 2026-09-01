@@ -65,6 +65,29 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
+# In[ ]:
+
+
+# ============================================================
+# CRYPTOGRAPHIC DEVICE IDENTITY
+# ============================================================
+# Device identity is based on a persistent Ed25519 private key.
+# MAC addresses, IP addresses, hostname, etc. are telemetry only
+# and MUST NOT be used as authentication identifiers.
+# ============================================================
+
+import secrets
+import stat
+import getpass
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.exceptions import InvalidSignature
+
+
 # ## Global Variables
 # 
 
@@ -100,7 +123,6 @@ APPEND_WAITERS = {}  # req_id -> (Event, holder)
 
 
 _TLS_CA_BUNDLE_PATH = None
-_TLS_CA_BUNDLE_LOGGED = False_TLS_CA_BUNDLE_PATH = None
 _TLS_CA_BUNDLE_LOGGED = False
 
 # --- TIMEOUT CONFIG (slave side) ---------------------------------
@@ -428,7 +450,7 @@ def set_cores_used(n: int, why: str = ""):
     with CORES_USED_LOCK:
         cores_used = n
     if why:
-        print(f"[CORES_USED] {cores_used} ({why})")
+        print(f"\n[CORES_USED] {cores_used} ({why})")
 
 
 # In[ ]:
@@ -983,6 +1005,311 @@ def get_machine_uid():
 #get_machine_uid()
 
 
+# In[ ]:
+
+
+# ============================================================
+# PERSISTENT CRYPTOGRAPHIC SLAVE DEVICE IDENTITY
+#
+# IMPORTANT:
+#   - Generated once per installation.
+#   - Survives reboot, network changes and software restart.
+#   - Ethernet/Wi-Fi/VPN/MAC/IP changes DO NOT change device_id.
+#   - Private key NEVER leaves this machine.
+#   - Relay authenticates this identity using challenge-response.
+# ============================================================
+
+IDENTITY_PROTOCOL = "BREAKEVEN-DEVICE-AUTH-V1"
+
+
+def _identity_base_dir():
+    """
+    Return persistent machine/application storage.
+
+    Do NOT place identity keys in temporary/update folders because
+    software upgrades must not generate a new device identity.
+    """
+    system = platform.system()
+
+    if system == "Windows":
+        root = os.environ.get("PROGRAMDATA") or os.path.expanduser("~")
+        return os.path.join(root, "Breakeven", "identity")
+
+    if system == "Darwin":
+        preferred = "/Library/Application Support/Breakeven/identity"
+        try:
+            os.makedirs(preferred, exist_ok=True)
+            return preferred
+        except Exception:
+            return os.path.expanduser(
+                "~/Library/Application Support/Breakeven/identity"
+            )
+
+    preferred = "/var/lib/breakeven/identity"
+
+    try:
+        os.makedirs(preferred, exist_ok=True)
+        return preferred
+    except Exception:
+        return os.path.expanduser("~/.local/share/breakeven/identity")
+
+
+def _harden_private_key_file(path):
+    """
+    Best-effort local protection.
+
+    Linux/macOS:
+        chmod 0600
+
+    Windows:
+        remove inherited ACLs and grant only current user + SYSTEM.
+
+    The installer should ALSO enforce these permissions.
+    """
+    try:
+        if os.name == "nt":
+            user = getpass.getuser()
+
+            subprocess.run(
+                [
+                    "icacls",
+                    path,
+                    "/inheritance:r",
+                    "/grant:r",
+                    f"{user}:(F)",
+                    "SYSTEM:(F)",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except Exception as e:
+        print(f"[IDENTITY][WARN] Could not harden private key ACL: {e}")
+
+
+def load_or_create_device_identity(role="slave"):
+    """
+    Load the permanent Ed25519 identity for this installation.
+
+    role-specific keys deliberately prevent a compromised Slave
+    identity from being reused to impersonate a Master.
+    """
+    identity_dir = _identity_base_dir()
+    os.makedirs(identity_dir, exist_ok=True)
+
+    private_path = os.path.join(
+        identity_dir,
+        f"{role}_identity_ed25519.pem",
+    )
+
+    if os.path.isfile(private_path):
+        with open(private_path, "rb") as f:
+            private_key = serialization.load_pem_private_key(
+                f.read(),
+                password=None,
+            )
+
+        if not isinstance(private_key, Ed25519PrivateKey):
+            raise RuntimeError(
+                f"Identity file is not an Ed25519 key: {private_path}"
+            )
+
+    else:
+        print(f"[IDENTITY] Creating NEW {role} cryptographic identity.")
+
+        private_key = Ed25519PrivateKey.generate()
+
+        pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+
+        tmp_path = private_path + ".tmp"
+
+        with open(tmp_path, "wb") as f:
+            f.write(pem)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_path, private_path)
+        _harden_private_key_file(private_path)
+
+    public_key = private_key.public_key()
+
+    public_raw = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+    public_key_b64 = base64.b64encode(public_raw).decode("ascii")
+
+    # Domain-separated fingerprint.
+    device_id = hashlib.sha256(
+        b"BREAKEVEN-DEVICE-ID-V1\x00" + public_raw
+    ).hexdigest()
+
+    return {
+        "role": role,
+        "private_key": private_key,
+        "public_key": public_key,
+        "public_key_b64": public_key_b64,
+        "device_id": device_id,
+        "private_key_path": private_path,
+    }
+
+
+SLAVE_IDENTITY = load_or_create_device_identity("slave")
+
+
+def get_device_crytographic_set_id():
+    """
+    Return the permanent cryptographic identity of this Slave installation.
+
+    IMPORTANT:
+      - This is NOT a MAC address.
+      - This does NOT change when Ethernet/Wi-Fi/IP changes.
+      - Relay uses this value as the canonical identity for slave_id.
+      - Possession is proven using the corresponding Ed25519 private key.
+    """
+    return SLAVE_IDENTITY["device_id"]
+
+
+# In[ ]:
+
+
+# ============================================================
+# DEVICE / NETWORK SECURITY TELEMETRY
+# ============================================================
+#
+# These values are OBSERVATIONS only.
+#
+# They MUST NEVER be used as proof of device identity.
+#
+# The Relay will retain historical values so that future IDS/IPS
+# logic can detect:
+#
+#   - new MAC addresses
+#   - new interfaces
+#   - new hostnames
+#   - new private addresses
+#   - operating system changes
+#   - unusual network changes
+#
+# Relay-observed public/source IP is more trustworthy than values
+# reported here because this entire structure is client supplied.
+# ============================================================
+
+def collect_network_identity_evidence():
+    result = {
+        "hostname": socket.gethostname(),
+        "platform": platform.system(),
+        "platform_release": platform.release(),
+        "platform_version": platform.version(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "interfaces": [],
+    }
+
+    try:
+        net_addrs = psutil.net_if_addrs()
+        net_stats = psutil.net_if_stats()
+
+        for interface_name, addresses in net_addrs.items():
+            stats = net_stats.get(interface_name)
+
+            interface_entry = {
+                "interface": interface_name,
+                "is_up": stats.isup if stats else None,
+                "speed_mbps": stats.speed if stats else None,
+                "mtu": stats.mtu if stats else None,
+                "mac_addresses": [],
+                "ipv4_addresses": [],
+                "ipv6_addresses": [],
+            }
+
+            for address in addresses:
+
+                if address.family == socket.AF_INET:
+                    interface_entry["ipv4_addresses"].append(
+                        address.address
+                    )
+
+                elif address.family == socket.AF_INET6:
+                    interface_entry["ipv6_addresses"].append(
+                        str(address.address).split("%")[0]
+                    )
+
+                elif (
+                    address.family == getattr(psutil, "AF_LINK", None)
+                    or address.family == getattr(socket, "AF_PACKET", None)
+                ):
+                    mac = str(address.address or "").strip().lower()
+
+                    if (
+                        mac
+                        and mac != "00:00:00:00:00:00"
+                        and mac not in interface_entry["mac_addresses"]
+                    ):
+                        interface_entry["mac_addresses"].append(mac)
+
+            result["interfaces"].append(interface_entry)
+
+    except Exception as e:
+        print(
+            f"[IDENTITY][WARN] Failed collecting network evidence: {e}"
+        )
+
+    return result
+
+
+# In[ ]:
+
+
+# ============================================================
+# AUTHENTICATION TRANSCRIPT
+# ============================================================
+#
+# Both Slave and Relay MUST construct these exact bytes.
+#
+# Signing the entire transcript prevents substitution of:
+#   role
+#   device_id
+#   public key
+#   client nonce
+#   server nonce
+#   challenge ID
+#
+# ============================================================
+
+def build_device_auth_transcript(
+    role,
+    device_id,
+    public_key_b64,
+    client_nonce,
+    server_nonce,
+    challenge_id,
+):
+    payload = {
+        "protocol": IDENTITY_PROTOCOL,
+        "role": role,
+        "device_id": device_id,
+        "public_key": public_key_b64,
+        "client_nonce": client_nonce,
+        "server_nonce": server_nonce,
+        "challenge_id": challenge_id,
+    }
+
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+
 # In[12]:
 
 
@@ -1147,6 +1474,99 @@ def recvall(sock, n):
         print(f"[SLAVE][RECV] DONE {total_mb:,.1f} MB in {elapsed:,.2f}s  avg={avg_speed:,.1f} MB/s")
 
     return data
+
+
+# In[ ]:
+
+
+def complete_device_authentication(
+    conn,
+    identity,
+    expected_client_nonce,
+    timeout=30.0,
+):
+    """
+    Prove possession of the private Ed25519 key.
+
+    Flow:
+
+        Slave -> auth_hello
+        Relay -> auth_challenge
+        Slave -> signed auth_response
+        Relay -> assign_id
+
+    The private key NEVER leaves this device.
+    """
+
+    raw = recv_message_timeout(conn, timeout)
+
+    if not raw:
+        raise TimeoutError(
+            "No cryptographic authentication challenge received"
+        )
+
+    challenge = json.loads(raw)
+
+    if challenge.get("command") != "auth_challenge":
+        raise RuntimeError(
+            f"Expected auth_challenge, received {challenge}"
+        )
+
+    if challenge.get("protocol") != IDENTITY_PROTOCOL:
+        raise RuntimeError(
+            "Authentication protocol mismatch"
+        )
+
+    challenge_id = str(
+        challenge.get("challenge_id") or ""
+    )
+
+    server_nonce = str(
+        challenge.get("server_nonce") or ""
+    )
+
+    echoed_client_nonce = str(
+        challenge.get("client_nonce") or ""
+    )
+
+    if not secrets.compare_digest(
+        echoed_client_nonce,
+        expected_client_nonce,
+    ):
+        raise RuntimeError(
+            "Authentication client nonce mismatch"
+        )
+
+    if not challenge_id or not server_nonce:
+        raise RuntimeError(
+            "Malformed authentication challenge"
+        )
+
+    transcript = build_device_auth_transcript(
+        role=identity["role"],
+        device_id=identity["device_id"],
+        public_key_b64=identity["public_key_b64"],
+        client_nonce=expected_client_nonce,
+        server_nonce=server_nonce,
+        challenge_id=challenge_id,
+    )
+
+    signature = identity["private_key"].sign(
+        transcript
+    )
+
+    safe_send(
+        conn,
+        {
+            "command": "auth_response",
+            "protocol": IDENTITY_PROTOCOL,
+            "device_id": identity["device_id"],
+            "challenge_id": challenge_id,
+            "signature": base64.b64encode(
+                signature
+            ).decode("ascii"),
+        },
+    )
 
 
 # # FE Imprinting Code
@@ -2633,7 +3053,9 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
                 }
             })
 
-
+            print(f"\n[WORK] Beginning POOL Processing")
+            
+            
             # --- Progress tracking ---
             total_subtasks = len(Inputs)
             completed = mp.Value('i', 0)  # Shared counter
@@ -2697,7 +3119,6 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             watchdog_thread.start()
 
 
-            print(f"[WORK] Beginning POOL Processing")
             
             # --- Safe multiprocessing with timeout ---
             try:
@@ -3329,12 +3750,14 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
     cpu_speed_max = round(cpu_freq.max, 2) if cpu_freq else None
     cpu_speed_cur = round(cpu_freq.current, 2) if cpu_freq else None
 
+
+    '''
     # Prepare handshake payload before hand
     handshake = {
         "role": "slave",
         "uid": get_machine_uid()
     }
-    
+    '''
     # Attempt to get memory speed (Windows only)
     try:
         mem_speed = None
@@ -3479,13 +3902,63 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     t_tls1 = timed_step("TLS_HANDSHAKE", t_tls0)
                     _dbg(f"[CONNECT] TLS ok: version={client.version()} cipher={client.cipher()}")
 
+
+                    # ============================================================
+                    # CRYPTOGRAPHIC DEVICE AUTHENTICATION
+                    # ============================================================
+                    #
+                    # uid:
+                    #     Existing hardware/network-style identifier.
+                    #     Kept for telemetry/history only.
+                    #
+                    # device_id:
+                    #     Permanent cryptographic identity.
+                    #     Relay uses THIS to allocate/reuse slave_id.
+                    #
+                    # A fresh nonce is generated for EVERY connection attempt.
+                    # ============================================================
+                    
+                    client_nonce = base64.b64encode(
+                        secrets.token_bytes(32)
+                    ).decode("ascii")
+                    
+                    handshake = {
+                        "command": "auth_hello",
+                        "protocol": IDENTITY_PROTOCOL,
+                    
+                        "role": "slave",
+                    
+                        # Existing identifier -- telemetry only.
+                        "uid": get_machine_uid(),
+                    
+                        # Canonical permanent device identity.
+                        "device_id": get_device_crytographic_set_id(),
+                    
+                        # Public Ed25519 key used by Relay for signature verification.
+                        "public_key": SLAVE_IDENTITY["public_key_b64"],
+                    
+                        # Fresh replay-protection value.
+                        "client_nonce": client_nonce,
+                    
+                        # Supplementary IDS/IPS telemetry.
+                        "network_evidence": collect_network_identity_evidence(),
+                    }
+
     
                     # 3) Send handshake
                     t_hs0 = _now_ms()
                     safe_send(client, handshake)
                     t_hs1 = timed_step("SEND_HANDSHAKE", t_hs0)
+
+                    # Relay now sends a fresh random challenge.
+                    complete_device_authentication(
+                        client,
+                        SLAVE_IDENTITY,
+                        client_nonce,
+                        timeout=30.0,
+                    )
     
-                    # 4) Wait assign_id (timeout)
+                    # 4) Authentication succeeded; Relay now returns canonical slave_id.
                     t_wait0 = _now_ms()
                     msg = recv_message_timeout(client, ASSIGN_ID_TIMEOUT)
                     t_wait1 = timed_step("WAIT_ASSIGN_ID", t_wait0)
@@ -3496,6 +3969,23 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                     data = json.loads(msg)
                     if data.get("command") != "assign_id":
                         raise Exception(f"Invalid handshake from master: {data}")
+                    if not data.get("identity_verified"):
+                        raise RuntimeError(
+                            "Relay did not confirm cryptographic authentication"
+                        )
+                    
+                    returned_device_id = str(
+                        data.get("device_id") or ""
+                    )
+                    
+                    if not secrets.compare_digest(
+                        returned_device_id,
+                        get_device_crytographic_set_id(),
+                    ):
+                        raise RuntimeError(
+                            "Relay returned mismatched device identity"
+                        )
+
     
                     slave_id = data["slave_id"]
                     total_ms = _now_ms() - t_start
@@ -3596,6 +4086,9 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                                 "slave_id": slave_id,
                                 "info": {
                                     "uid": get_machine_uid(),
+                                    "device_id": get_device_crytographic_set_id(),
+                                    "identity_protocol": IDENTITY_PROTOCOL,
+                                    "network_evidence": collect_network_identity_evidence(),
                                     "work_status": WORK_STATUS,
                                     "slave_name": slave_name,
                                     "version": version,
@@ -3624,6 +4117,9 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                                 "slave_id": slave_id,
                                 "info": {
                                     "uid": get_machine_uid(),
+                                    "device_id": get_device_crytographic_set_id(),
+                                    "identity_protocol": IDENTITY_PROTOCOL,
+                                    "network_evidence": collect_network_identity_evidence(),
                                     "work_status": WORK_STATUS,
                                     "slave_name": slave_name,
                                     "version": version,

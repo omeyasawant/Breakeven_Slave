@@ -20,3 +20,5 @@ bokeh
 tqdm
 pyarrow
 certifi
+cryptography==42.0.8
+zstandard==0.22.0
