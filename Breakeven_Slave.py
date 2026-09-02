@@ -2590,6 +2590,64 @@ def api_write_text(conn, slave_id, work_id, token, dir_name, text: str, abs_path
 # In[ ]:
 
 
+def estimate_available_logical_cores(
+    samples=3,
+    interval=0.25,
+):
+
+    total_cores = (
+        psutil.cpu_count(
+            logical=True
+        )
+        or 1
+    )
+
+    usages = []
+
+    for _ in range(
+        max(
+            1,
+            int(samples)
+        )
+    ):
+
+        usage = psutil.cpu_percent(
+            interval=interval
+        )
+
+        usages.append(
+            float(usage)
+        )
+
+    # Median rejects a temporary CPU spike much better
+    # than a single observation.
+    usages.sort()
+
+    median_usage = usages[
+        len(usages) // 2
+    ]
+
+    available = round(
+        (
+            100.0
+            - median_usage
+        )
+        / 100.0
+        * total_cores
+    )
+
+    return max(
+        1,
+        min(
+            int(total_cores),
+            int(available)
+        )
+    )
+
+
+# In[ ]:
+
+
 '''
 def load_buffer_cores_from_file(default: int = 6) -> int:
     """
@@ -3029,7 +3087,8 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             # Dynamically estimate available CPU cores
             total_cores = psutil.cpu_count(logical=True)
             cpu_usage = psutil.cpu_percent(interval=1)
-            available_cores = int((100 - cpu_usage) / 100 * total_cores)
+            #available_cores = int((100 - cpu_usage) / 100 * total_cores)
+            available_cores = estimate_available_logical_cores()
             pool_size = max(1, min(available_cores - buffer_cores, work_shares))
 
             execution_workers_used = pool_size
@@ -3266,7 +3325,8 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
             # Choose pool size similar to your FE logic
             total_cores = psutil.cpu_count(logical=True)
             cpu_usage = psutil.cpu_percent(interval=1)
-            available_cores = int((100 - cpu_usage) / 100 * total_cores)
+            #available_cores = int((100 - cpu_usage) / 100 * total_cores)
+            available_cores = estimate_available_logical_cores()
             pool_size = max(1, min(available_cores - buffer_cores, total_subtasks))
 
             execution_workers_used = pool_size
@@ -3479,6 +3539,7 @@ def do_work(conn,work_id, work_name, work_type, work_data, work_shares,total_sha
                     "execution_stats": {
                         "schema_version": 1,
                         "workers_used": reported_workers_used,
+                        "peak_cores_used": reported_workers_used,
                         "shares_assigned": int(work_shares),
                         "shares_processed": int(
                             execution_shares_processed
@@ -4096,7 +4157,8 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                                     "ip": get_ip_address(),
                                     "platform": platform.system(),
                                     "cpu_count": psutil.cpu_count(logical=True),
-                                    "cpu_available_estimate": max(1, round((100 - psutil.cpu_percent(interval=1)) / 100 * psutil.cpu_count(logical=True))),
+                                    #"cpu_available_estimate": max(1, round((100 - psutil.cpu_percent(interval=1)) / 100 * psutil.cpu_count(logical=True))),
+                                    "cpu_available_estimate": estimate_available_logical_cores(),
                                     "cpu_speed_mhz": cpu_speed_cur,
                                     "cpu_speed_mhz_max": cpu_speed_max,
                                     "memory_available_gb": round(psutil.virtual_memory().available / (1024**3), 2),
@@ -4127,7 +4189,8 @@ def connect_to_master(master_ip='relay.breakeventx.com', master_port=8888):
                                     "ip": get_ip_address(),
                                     "platform": platform.system(),
                                     "cpu_count": psutil.cpu_count(logical=True),
-                                    "cpu_available_estimate": max(1, round((100 - psutil.cpu_percent(interval=1)) / 100 * psutil.cpu_count(logical=True))),
+                                    #"cpu_available_estimate": max(1, round((100 - psutil.cpu_percent(interval=1)) / 100 * psutil.cpu_count(logical=True))),
+                                    "cpu_available_estimate": estimate_available_logical_cores(),
                                     "cpu_speed_mhz": cpu_speed_cur,
                                     "cpu_speed_mhz_max": cpu_speed_max,
                                     "memory_available_gb": round(psutil.virtual_memory().available / (1024**3), 2),
