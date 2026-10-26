@@ -1,0 +1,115 @@
+# ============================================================================
+# ONE-TIME Apple Developer ID p12 export workflow.
+#
+# HOW TO USE:
+#   1. Copy this file to:  Breakeven_Slave/.github/workflows/setup-apple-certs.yml
+#      (the Breakeven_Slave repo is fine; the p12 it produces is reused for
+#      ALL repos - it contains both your Developer ID certificates).
+#   2. Push, then in GitHub: Actions -> "One-time Apple cert setup" ->
+#      "Run workflow" and fill in the four base64 inputs:
+#         private_key_1_base64 <- apple_dev.key.base64.txt   (pairs with the
+#                                    certificate you created from apple_dev.csr)
+#         private_key_2_base64 <- apple_dev2.key.base64.txt  (pairs with the
+#                                    certificate you created from apple_dev2.csr)
+#         app_cer_base64       <- app.cer.base64.txt
+#         installer_cer_base64 <- installer.cer.base64.txt
+#      (Each certificate pairs with the private key from the CSR used to create
+#      it; the import order below lets the keychain match them automatically.)
+#   3. The job prints the p12 base64 between markers. Copy it into your repo
+#      secrets:
+#         service repos  -> APPLE_BUILD_CERTIFICATE_BASE64
+#         electron repos -> APPLE_SIGNING_CERTIFICATE_P12_BASE64
+#      Also note the identity names printed by `security find-identity`:
+#         Developer ID Application: Breakeven Private Limited (TEAMID)
+#         Developer ID Installer:  Breakeven Private Limited (TEAMID)
+#   4. DELETE this workflow file from the repo afterwards, and consider the
+#      run log sensitive - delete the workflow run (Actions -> ... -> Delete)
+#      so the base64 blobs are not retained.
+#
+# The p12 password is supplied as the workflow input p12_password - choose a
+# strong one and store it as APPLE_BUILD_CERTIFICATE_PASSWORD /
+# APPLE_SIGNING_CERTIFICATE_PASSWORD in the repo secrets.
+# ============================================================================
+
+name: One-time Apple cert setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      private_key_1_base64:
+        description: "Base64 of apple_dev.key (key for the cert made from apple_dev.csr)"
+        required: true
+      private_key_2_base64:
+        description: "Base64 of apple_dev2.key (key for the cert made from apple_dev2.csr)"
+        required: true
+      app_cer_base64:
+        description: "Base64 of the Developer ID Application .cer"
+        required: true
+      installer_cer_base64:
+        description: "Base64 of the Developer ID Installer .cer"
+        required: true
+      p12_password:
+        description: "Export password for the p12 (strong; store as cert password secret)"
+        required: true
+
+jobs:
+  export-p12:
+    runs-on: macos-15-intel
+    steps:
+      - name: Assemble keychain and export p12
+        shell: bash
+        env:
+          PRIVATE_KEY_1_BASE64: ${{ inputs.private_key_1_base64 }}
+          PRIVATE_KEY_2_BASE64: ${{ inputs.private_key_2_base64 }}
+          APP_CER_BASE64: ${{ inputs.app_cer_base64 }}
+          INSTALLER_CER_BASE64: ${{ inputs.installer_cer_base64 }}
+          P12_PASSWORD: ${{ inputs.p12_password }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+
+          KEYCHAIN="apple-setup.keychain-db"
+          KEYCHAIN_PASS="temp-$(uuidgen)"
+
+          echo "$PRIVATE_KEY_1_BASE64" | base64 --decode > apple_dev.key
+          echo "$PRIVATE_KEY_2_BASE64" | base64 --decode > apple_dev2.key
+          echo "$APP_CER_BASE64"       | base64 --decode > app.cer
+          echo "$INSTALLER_CER_BASE64" | base64 --decode > installer.cer
+
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+
+          # Both private keys first, then both certificates, so each cert pairs
+          # with the key from its own CSR.
+          security import apple_dev.key  -k "$KEYCHAIN" -T /usr/bin/security -T /usr/bin/codesign
+          security import apple_dev2.key -k "$KEYCHAIN" -T /usr/bin/security -T /usr/bin/codesign
+          security import app.cer        -k "$KEYCHAIN" -T /usr/bin/security -T /usr/bin/codesign
+          security import installer.cer  -k "$KEYCHAIN" -T /usr/bin/security -T /usr/bin/codesign
+
+          echo "== Identities in keychain (note the exact names for your secrets) =="
+          security find-identity -v "$KEYCHAIN"
+
+          # Export all signing identities (both certs + the shared private key).
+          security export -k "$KEYCHAIN" -t identities -f pkcs12 -P "$P12_PASSWORD" -o breakeven-developer-id.p12
+
+          # Verify the p12 round-trips.
+          security import breakeven-developer-id.p12 -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign 2>/dev/null || true
+
+          echo ""
+          echo "================= P12 BASE64 START ================="
+          base64 -i breakeven-developer-id.p12
+          echo "================== P12 BASE64 END =================="
+          echo ""
+          echo "Copy everything between the markers into your repo secrets:"
+          echo "  service repos  (Slave/Tray/Updater): APPLE_BUILD_CERTIFICATE_BASE64"
+          echo "  electron repos (Dashboard/Installer): APPLE_SIGNING_CERTIFICATE_P12_BASE64"
+          echo "Then DELETE this workflow and delete this workflow run's logs."
+
+      - name: Scrub temp material
+        if: always()
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP" 2>/dev/null || exit 0
+          rm -f apple_dev.key apple_dev2.key app.cer installer.cer breakeven-developer-id.p12 || true
+          security delete-keychain apple-setup.keychain-db 2>/dev/null || true
