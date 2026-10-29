@@ -101,15 +101,15 @@ jobs:
           echo "MACOS_NOTARIZATION_ENABLED=false" >> "$GITHUB_ENV"
 
           missing=()
-          for var in BUILD_CERTIFICATE_BASE64 P12_PASSWORD KEYCHAIN_PASSWORD APPLE_SIGNING_IDENTITY; do
+          for var in BUILD_CERTIFICATE_BASE64 P12_PASSWORD KEYCHAIN_PASSWORD APPLE_SIGNING_IDENTITY APPLE_INSTALLER_SIGNING_IDENTITY APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
             if [ -z "${!var:-}" ]; then
               missing+=("$var")
             fi
           done
 
           if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::warning::macOS Developer ID signing secrets missing (${missing[*]}). Building ad-hoc signed universal app."
-            exit 0
+            echo "::error::macOS Developer ID signing/notarization secrets missing (${missing[*]}). Refusing to build an unsigned/non-notarized release."
+            exit 1
           fi
 
           CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
@@ -127,22 +127,25 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
           security default-keychain -d user -s "$KEYCHAIN_PATH"
 
+          echo "== Imported identities =="
+          security find-identity -v "$KEYCHAIN_PATH"
+          if ! security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -F "$APPLE_SIGNING_IDENTITY"; then
+            echo "::error::APPLE_SIGNING_IDENTITY ('$APPLE_SIGNING_IDENTITY') not found among imported identities."
+            exit 1
+          fi
+          if ! security find-identity -v "$KEYCHAIN_PATH" | grep -F "$APPLE_INSTALLER_SIGNING_IDENTITY"; then
+            echo "::error::APPLE_INSTALLER_SIGNING_IDENTITY ('$APPLE_INSTALLER_SIGNING_IDENTITY') not found among imported identities."
+            exit 1
+          fi
+
           echo "MACOS_SIGNING_ENABLED=true" >> "$GITHUB_ENV"
           echo "MACOS_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
           echo "MACOS_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
-          if [ -n "${APPLE_INSTALLER_SIGNING_IDENTITY:-}" ]; then
-            echo "MACOS_PKG_SIGNING_ENABLED=true" >> "$GITHUB_ENV"
-            echo "MACOS_PKG_SIGNING_IDENTITY=$APPLE_INSTALLER_SIGNING_IDENTITY" >> "$GITHUB_ENV"
-          else
-            echo "::warning::APPLE_INSTALLER_SIGNING_IDENTITY is missing. The macOS .pkg will be built unsigned."
-          fi
+          echo "MACOS_PKG_SIGNING_ENABLED=true" >> "$GITHUB_ENV"
+          echo "MACOS_PKG_SIGNING_IDENTITY=$APPLE_INSTALLER_SIGNING_IDENTITY" >> "$GITHUB_ENV"
 
-          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APPLE_INSTALLER_SIGNING_IDENTITY:-}" ]; then
-            echo "MACOS_NOTARIZATION_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "::warning::Apple notarization secrets or APPLE_INSTALLER_SIGNING_IDENTITY are missing. The macOS .pkg will not be notarized."
-          fi
+          echo "MACOS_NOTARIZATION_ENABLED=true" >> "$GITHUB_ENV"
 
 
 
@@ -150,13 +153,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash -l {0}
         run: |
-          python -m PyInstaller --onefile Breakeven_Slave.py             --name Breakeven_Slave                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting                         --collect-submodules cryptography             --collect-submodules pkg_resources                         --collect-submodules zstandard             --copy-metadata setuptools             --copy-metadata pandas-ta             --hidden-import pkg_resources             --hidden-import setuptools             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
+          python -m PyInstaller --onefile Breakeven_Slave.py             --name Breakeven_Slave             --icon icon.ico                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting                         --collect-submodules cryptography             --collect-submodules pkg_resources                         --collect-submodules zstandard             --copy-metadata setuptools             --copy-metadata pandas-ta             --hidden-import pkg_resources             --hidden-import setuptools             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil
 
       - name: Build (macOS .pkg)
         if: runner.os == 'macOS'
         shell: bash -l {0}
         run: |
-          echo "::warning::Building Breakeven_Slave as x86_64 for Intel and Apple Silicon via Rosetta because universal2 dependencies are unavailable."
+          echo "::notice::Building Breakeven_Slave as x86_64 (Intel + Apple Silicon via Rosetta); universal2 dependency set is not yet available."
+
+          if [ "${MACOS_SIGNING_ENABLED:-false}" != "true" ] || [ "${MACOS_PKG_SIGNING_ENABLED:-false}" != "true" ]; then
+            echo "::error::Developer ID signing is required but not enabled. The signing configuration step should have failed."
+            exit 1
+          fi
 
           cat > build-macos-entitlements.plist << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -176,28 +184,20 @@ jobs:
           PYINSTALLER_MAC_ARGS=(
             --target-arch x86_64
             --osx-bundle-identifier com.breakeven.slave
+            --codesign-identity "$MACOS_SIGNING_IDENTITY"
+            --osx-entitlements-file "$PWD/build-macos-entitlements.plist"
           )
 
-          if [ "${MACOS_SIGNING_ENABLED:-false}" = "true" ]; then
-            PYINSTALLER_MAC_ARGS+=(
-              --codesign-identity "$MACOS_SIGNING_IDENTITY"
-              --osx-entitlements-file "$PWD/build-macos-entitlements.plist"
-            )
-          else
-            echo "::warning::Building Breakeven_Slave with PyInstaller ad-hoc signing because Developer ID secrets were not provided."
-          fi
-
           # Build an x86_64 app bundle (runs on Intel and on Apple Silicon via Rosetta)
-          python -m PyInstaller --onedir --windowed Breakeven_Slave.py             --name Breakeven_Slave                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting                         --collect-submodules cryptography             --collect-submodules pkg_resources                         --collect-submodules zstandard             --copy-metadata setuptools             --copy-metadata pandas-ta             --hidden-import pkg_resources             --hidden-import setuptools             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil             "${PYINSTALLER_MAC_ARGS[@]}"
+          python -m PyInstaller --onedir --windowed Breakeven_Slave.py             --name Breakeven_Slave             --icon icon.icns                         --collect-data certifi             --collect-data backtesting             --collect-submodules backtesting                         --collect-submodules cryptography             --collect-submodules pkg_resources                         --collect-submodules zstandard             --copy-metadata setuptools             --copy-metadata pandas-ta             --hidden-import pkg_resources             --hidden-import setuptools             --hidden-import breakeven_quant             --hidden-import pandas_ta             --hidden-import ta             --hidden-import backtesting             --hidden-import bokeh             --hidden-import seaborn             --hidden-import plotly             --hidden-import numba             --hidden-import pyarrow             --hidden-import psutil             "${PYINSTALLER_MAC_ARGS[@]}"
 
           PACKAGE_VERSION="${BREAKEVEN_PKG_VERSION:-1.0.0}"
 
-          if [ "${MACOS_PKG_SIGNING_ENABLED:-false}" = "true" ]; then
-            pkgbuild               --component "dist/Breakeven_Slave.app"               --install-location "/Library/Application Support/BreakEvenClient/client_service"               --identifier "com.breakeven.slave.pkg"               --version "$PACKAGE_VERSION"               --sign "$MACOS_PKG_SIGNING_IDENTITY"               "dist/Breakeven_Slave.pkg"
-          else
-            echo "::warning::Building Breakeven_Slave.pkg without Developer ID Installer signing."
-            pkgbuild               --component "dist/Breakeven_Slave.app"               --install-location "/Library/Application Support/BreakEvenClient/client_service"               --identifier "com.breakeven.slave.pkg"               --version "$PACKAGE_VERSION"               "dist/Breakeven_Slave.pkg"
-          fi
+          pkgbuild             --component "dist/Breakeven_Slave.app"             --install-location "/Library/Application Support/BreakEvenClient/client_service"             --identifier "com.breakeven.slave.pkg"             --version "$PACKAGE_VERSION"             --sign "$MACOS_PKG_SIGNING_IDENTITY"             "dist/Breakeven_Slave.pkg"
+
+          echo "== Verifying Breakeven_Slave.app and .pkg signatures =="
+          codesign --verify --deep --strict --verbose=2 "dist/Breakeven_Slave.app"
+          pkgutil --check-signature "dist/Breakeven_Slave.pkg"
 
       - name: Notarize macOS package
         if: runner.os == 'macOS'
@@ -208,13 +208,27 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           if [ "${MACOS_NOTARIZATION_ENABLED:-false}" != "true" ]; then
-            echo "::warning::Skipping notarization for Breakeven_Slave.pkg because notarization prerequisites are unavailable."
-            exit 0
+            echo "::error::Notarization prerequisites are unavailable. The signing configuration step should have failed."
+            exit 1
           fi
 
           xcrun notarytool submit "dist/Breakeven_Slave.pkg"             --apple-id "$APPLE_ID"             --password "$APPLE_APP_SPECIFIC_PASSWORD"             --team-id "$APPLE_TEAM_ID"             --wait
 
           xcrun stapler staple "dist/Breakeven_Slave.pkg"
+
+          echo "== Validating stapled notarization ticket =="
+          validate_ok=false
+          for attempt in 1 2 3 4 5; do
+            if xcrun stapler validate "dist/Breakeven_Slave.pkg"; then
+              validate_ok=true
+              break
+            fi
+            echo "::warning::stapler validate attempt $attempt failed (possible transient Apple CloudKit network error). Retrying in 15s..."
+            sleep 15
+          done
+          if [ "$validate_ok" != "true" ]; then
+            echo "::warning::stapler validate could not reach Apple's ticket service, but notarization returned 'Accepted' and 'staple' succeeded, so the ticket is already stapled to the .pkg. Continuing."
+          fi
 
       - name: Clean up macOS signing keychain
         if: runner.os == 'macOS' && always()
@@ -246,10 +260,7 @@ jobs:
           Terminal=true
           EOF
 
-          # Minimal 1x1 PNG icon (base64) so AppImage has an icon file
-          base64 -d > AppDir/Breakeven_Slave.png << 'EOF'
-          iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQImWNgYGD4DwABBAEAHnLrWQAAAABJRU5ErkJggg==
-          EOF
+          cp icon.png AppDir/Breakeven_Slave.png
 
           # AppRun launcher
           cat > AppDir/AppRun << 'EOF'
